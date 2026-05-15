@@ -1,0 +1,3 @@
+{
+  "tests/test_safety_guard.py::TestKillSwitch::test_daily_loss_triggers_kill_switch": true
+}

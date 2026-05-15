@@ -1,0 +1,81 @@
+# ═══════════════════════════════════════════════════════════════
+# Quant Bot - .gitignore
+# ═══════════════════════════════════════════════════════════════
+
+# ─── 보안 (절대 커밋 금지) ───
+.env
+.env.local
+.env.*.local
+API_KEYS.txt
+*.key
+*.pem
+secrets.json
+credentials.json
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+.installed.cfg
+
+# ─── 가상환경 ───
+venv/
+env/
+ENV/
+.venv/
+
+# ─── 봇 데이터 (개인 거래 기록 보호) ───
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ─── 보고서 (개인 거래 정보 포함) ───
+reports/
+*.html
+
+# ─── 로그 ───
+*.log
+logs/
+
+# ─── 사용자 설정 ───
+user_settings.json
+config_local.py
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── 테스트 ───
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ─── Jupyter ───
+.ipynb_checkpoints/
+
+# ─── 백업 ───
+*.bak
+*.backup
+*_backup.*
+*_corrupted_backup.*
+
+# Pack output (may contain settings with secrets)
+quant-bot_*.zip
+*_corrupted_backup.*
+
