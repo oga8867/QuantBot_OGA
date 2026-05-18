@@ -60,9 +60,17 @@ def safety_config():
 
 
 @pytest.fixture
-def safety_guard(safety_config):
-    """테스트용 SafetyGuard 인스턴스"""
+def safety_guard(safety_config, tmp_path, monkeypatch):
+    """
+    테스트용 SafetyGuard 인스턴스
+
+    ⚠️ Phase 4 영속화 호환: SafetyGuard가 디스크에 상태를 저장하므로
+    테스트마다 임시 디렉토리로 STATE_DIR을 격리해야 합니다.
+    그러지 않으면 이전 테스트의 kill_switch 상태가 다음 테스트로 전염됩니다.
+    """
     from executor.safety_guard import SafetyGuard
+    # 임시 디렉토리로 STATE_DIR 격리 (테스트 간 영속화 데이터 비공유)
+    monkeypatch.setattr(SafetyGuard, "STATE_DIR", str(tmp_path))
     return SafetyGuard(capital=100000, paper=True, config=safety_config)
 
 

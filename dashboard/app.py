@@ -231,13 +231,15 @@ def _get_default_settings() -> dict:
         "capital": 10_000_000,           # 초기 자본금 (원)
         "currency": "KRW",               # 통화 단위
         "risk_per_trade": 0.02,          # 거래당 리스크 (2%)
-        "max_position_size": 0.10,       # 최대 포지션 크기 (10%)
+        "max_position_size": 0.10,       # 최대 포지션 크기 (비율, 10%)
+        "max_order_value": 0,            # 최대 주문 금액 (절대값, 원). 0=자동(자본의 20%)
         "max_daily_loss": 0.03,          # 일일 최대 손실 (3%)
         "max_drawdown": 0.15,            # 최대 드로우다운 (15%)
         "stop_loss_atr_multiplier": 2.0, # 손절 ATR 배수
         "risk_reward_ratio": 2.0,        # 위험보상비율
         "sizing_method": "kelly",        # 포지션 사이징 방법
         "kelly_fraction": 0.5,           # 켈리 비율 (하프 켈리)
+        "kelly_min_trades": 20,          # Kelly 적용 최소 거래 수 (미만이면 fixed)
         "broker": "paper",               # 브로커 (paper/alpaca/kis)
         "live_mode": False,              # 실거래 모드 여부
         "us_watchlist": US_WATCHLIST.copy(),   # 미국 관심종목
@@ -247,6 +249,7 @@ def _get_default_settings() -> dict:
         "discord_webhook_url": "",       # 디스코드 웹훅 URL
         "discord_bot_token": "",         # 디스코드 봇 토큰 (양방향 명령용)
         "discord_bot_channel_id": "",    # 명령 허용 채널 ID (빈값이면 전체 허용)
+        "discord_bot_app_id": "",        # 디스코드 봇 Application ID (초대 링크 생성용)
         "discord_bot_autostart": False,  # 대시보드 시작 시 봇 자동 시작
         "dart_api_key": "",              # DART 공시 API 키
         # ── 브로커 API 키 (실거래용) ──
@@ -256,10 +259,8 @@ def _get_default_settings() -> dict:
         "alpaca_api_key": "",            # Alpaca API Key
         "alpaca_secret_key": "",         # Alpaca Secret Key
         "analysis_interval": "60",       # 분석 주기 (분 단위)
-        "schedule_kr_start": "09:05",    # 한국 시장 분석 시작 시간
-        "schedule_kr_end": "15:20",      # 한국 시장 분석 종료 시간
-        "schedule_us_start": "22:35",    # 미국 시장 분석 시작 시간 (한국시간)
-        "schedule_us_end": "05:00",      # 미국 시장 분석 종료 시간
+        # 주의: 시장 시간은 코드에 고정됨 (KR 09:00~15:30, US는 DST 자동).
+        # 과거 schedule_kr/us_start/end 설정은 실제로 쓰이지 않아 제거됨.
         "interest_sectors": ["semiconductor_ai", "bigtech_platform", "energy_battery"],
         # 종목 자동 발굴 설정
         "discovery_enabled": True,              # 자동 발굴 활성화
@@ -284,14 +285,6 @@ def _get_default_settings() -> dict:
         #     (자동 발굴 종목 차단, 빈 워치리스트일 때 기본값 fallback 안 함)
         # OFF: 기본 동작 (워치리스트 + 자동발굴 + 보유종목)
         "watchlist_strict_mode": False,
-        # ── 한국 시간외 거래 (KRX 전용) ──
-        # OFF (기본): 정규장 09:00~15:30만 매매
-        # ON: 봇이 정규장 외 시간대에도 적합한 주문 유형 자동 선택
-        #     - 15:40~16:00 → AFTER_HOURS_CLOSE (종가 매매)
-        #     - 16:00~18:00 → AFTER_HOURS_SINGLE (시간외 단일가, 전일 종가 ±10%)
-        # ⚠️ 시간외는 유동성 낮음 + 슬리피지 큼 → 권장 OFF
-        # 청산(매도) 전용으로만 쓰려면 "exit_only" 설정 가능
-        "kr_after_hours_mode": "off",  # "off" / "exit_only" / "full"
     }
 
 
@@ -1043,12 +1036,14 @@ def api_start_bot():
             risk=RiskConfig(
                 risk_per_trade=current_settings["risk_per_trade"],
                 max_position_size=current_settings["max_position_size"],
+                max_order_value=current_settings.get("max_order_value", 0),
                 max_daily_loss=current_settings["max_daily_loss"],
                 max_drawdown=current_settings["max_drawdown"],
                 stop_loss_atr_multiplier=current_settings["stop_loss_atr_multiplier"],
                 risk_reward_ratio=current_settings["risk_reward_ratio"],
                 sizing_method=current_settings["sizing_method"],
                 kelly_fraction=current_settings["kelly_fraction"],
+                kelly_min_trades=current_settings.get("kelly_min_trades", 20),
             )
         )
 
@@ -1370,19 +1365,30 @@ def api_list_reports():
             return jsonify({"reports": []})
 
         files = []
+        # ★ 주간/월간 보고서(weekly_report_*, monthly_report_*)도 목록에 포함.
+        #   이전엔 daily_/market_만 필터해 주간·월간 보고서가 UI 목록에 안 떴음.
+        report_prefixes = ("daily_", "market_", "weekly_report_", "monthly_report_")
         for f in os.listdir(reports_dir):
-            if f.endswith(".html") and (f.startswith("daily_") or f.startswith("market_")):
-                filepath = os.path.join(reports_dir, f)
-                stat = os.stat(filepath)
-                files.append({
-                    "filename": f,
-                    "date": f.replace("daily_", "").replace("market_", "").replace(".html", ""),
-                    "size": stat.st_size,
-                    "created": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                })
+            if not (f.endswith(".html") and f.startswith(report_prefixes)):
+                continue
+            filepath = os.path.join(reports_dir, f)
+            stat = os.stat(filepath)
+            # 표시용 라벨 — 접두사와 .html 확장자 제거
+            label = f[:-len(".html")]
+            for p in report_prefixes:
+                if label.startswith(p):
+                    label = label[len(p):]
+                    break
+            files.append({
+                "filename": f,
+                "date": label,
+                "size": stat.st_size,
+                "created": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
 
-        # 최신순 정렬
-        files.sort(key=lambda x: x["date"], reverse=True)
+        # 최신순 정렬 — 보고서 유형마다 파일명 형식이 달라
+        # 생성시각(mtime) 기준으로 정렬해야 안정적이다.
+        files.sort(key=lambda x: x["created"], reverse=True)
         return jsonify({"reports": files})
 
     except Exception as e:
@@ -1540,10 +1546,8 @@ def api_equity():
             if eq_history:
                 return jsonify(eq_history)
 
-            # 없으면 portfolio_snapshots (일별) 폴백
-            snapshots = db.get_snapshots(days=days)
-            # snapshots는 mode 필터를 별도로 추가하지 않았으므로 메모리에서 필터
-            snapshots = [s for s in snapshots if s.get("mode", "paper") == mode_filter]
+            # 없으면 portfolio_snapshots (일별) 폴백 (★ Phase 10: mode 필터)
+            snapshots = db.get_snapshots(days=days, mode=mode_filter)
             rows = [
                 {"date": s["date"], "total_value": s["total_value"],
                  "daily_return": s.get("daily_return", 0),
@@ -1595,8 +1599,8 @@ def api_performance():
             avg_win = (total_win / win_count) if win_count > 0 else 0
             avg_loss = (total_loss / loss_count) if loss_count > 0 else 0
 
-            # MDD 계산
-            mdd = db.calculate_max_drawdown(days=90)
+            # MDD 계산 (★ Phase 10: 현재 모드만)
+            mdd = db.calculate_max_drawdown(days=90, mode=mode_filter)
 
             # 샤프비 계산 (★ Phase 5: 현재 모드만)
             eq_history = db.get_equity_history(days=90, mode=mode_filter)
@@ -1647,12 +1651,11 @@ def api_signals():
     DB에서 신호를 가져오고 한국 종목에는 종목명을 추가합니다.
     """
     limit = request.args.get("limit", 30, type=int)
+    # ★ mode 필터 — paper/live 신호 섞임 방지
+    mode_filter = _current_display_mode()
     try:
         with DatabaseManager() as db:
-            cursor = db.conn.execute(
-                "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
-            )
-            rows = [dict(row) for row in cursor.fetchall()]
+            rows = db.get_signals(limit=limit, mode=mode_filter)
 
         # ── 각 신호에 종목명 추가 (DB 해제 후 처리) ──
         for r in rows:
@@ -1933,6 +1936,8 @@ def _run_scanner(stocks_to_scan: list):
                     "change_1d": round(change_1d, 2),
                     "rsi": round(float(df_analyzed["RSI"].iloc[-1]), 1) if "RSI" in df_analyzed.columns else 0,
                     "volume": int(df_analyzed["Volume"].iloc[-1]) if "Volume" in df_analyzed.columns else 0,
+                    # ★ 신호 판단 근거 — 스캐너 카드에서 "왜 이 신호인지" 펼쳐보기용
+                    "reasons": list(signal.reasons) if getattr(signal, "reasons", None) else [],
                 })
 
                 logger.info(f"[스캐너] {symbol} ({stock_name}): {signal.signal} "
@@ -2173,6 +2178,8 @@ def api_trades_recent():
                 "quantity": t.get("quantity", 0),
                 "price": t.get("price", 0),
                 "total": t.get("total", 0),
+                # ★ 손익 — in-memory trade_history는 "realized_pnl" 키 사용
+                "pnl": t.get("realized_pnl", t.get("pnl", 0)),
                 "strategy": t.get("strategy", ""),
                 "timestamp": t.get("timestamp", "").isoformat()
                     if hasattr(t.get("timestamp", ""), "isoformat")
@@ -2394,9 +2401,14 @@ def api_weekly_report():
 
     쿼리 파라미터:
         period: "weekly" 또는 "monthly" (기본 weekly)
+        mode: "paper" / "live" / "current" (기본 current = 현재 봇 모드)
+              ★ 모의투자와 실거래 실적이 한 보고서에 섞이지 않도록 분리
     """
     data = request.get_json() or {}
     period = data.get("period", "weekly")
+    mode = data.get("mode", "current")
+    if mode == "current":
+        mode = _current_display_mode()
 
     try:
         from reporter.weekly_report import WeeklyReportGenerator
@@ -2404,11 +2416,11 @@ def api_weekly_report():
         with DatabaseManager() as db:
             gen = WeeklyReportGenerator(db=db, report_dir="reports")
             capital = current_settings.get("capital", 100000)
-            filepath = gen.generate(period=period, capital=capital)
+            filepath = gen.generate(period=period, capital=capital, mode=mode)
 
         if filepath:
             filename = os.path.basename(filepath)
-            return jsonify({"success": True, "filename": filename})
+            return jsonify({"success": True, "filename": filename, "mode": mode})
         else:
             return jsonify({"success": False, "error": "보고서 생성 실패"})
 
@@ -2604,12 +2616,14 @@ def _discord_start_bot_callback() -> dict:
             risk=RiskConfig(
                 risk_per_trade=current_settings["risk_per_trade"],
                 max_position_size=current_settings["max_position_size"],
+                max_order_value=current_settings.get("max_order_value", 0),
                 max_daily_loss=current_settings["max_daily_loss"],
                 max_drawdown=current_settings["max_drawdown"],
                 stop_loss_atr_multiplier=current_settings["stop_loss_atr_multiplier"],
                 risk_reward_ratio=current_settings["risk_reward_ratio"],
                 sizing_method=current_settings["sizing_method"],
                 kelly_fraction=current_settings["kelly_fraction"],
+                kelly_min_trades=current_settings.get("kelly_min_trades", 20),
             )
         )
         settings.discovery = DiscoveryConfig(
@@ -2818,44 +2832,58 @@ def api_reset_bot():
             "error": "봇이 실행 중입니다. 먼저 봇을 중지한 후 초기화하세요."
         }), 400
 
+    # ★ 초기화 대상 모드 지정 필수 — 모의/실거래 데이터를 분리 초기화한다.
+    #   (이전엔 모드 무관 전체 삭제 → 모의 초기화로 실거래 이력까지 소실)
+    body = request.get_json(silent=True) or {}
+    mode = body.get("mode")
+    if mode not in ("paper", "live"):
+        return jsonify({
+            "error": "초기화할 모드를 지정하세요 (paper 또는 live)."
+        }), 400
+    mode_kr = "모의거래" if mode == "paper" else "실거래"
+
     try:
-        # DB 데이터 삭제
+        # DB 데이터 삭제 (지정한 모드만)
         with DatabaseManager() as reset_db:
-            deleted = reset_db.reset_all_data()
-        logger.info(f"[대시보드] DB 초기화 완료: {deleted}")
+            deleted = reset_db.reset_all_data(mode=mode)
+        logger.info(f"[대시보드] DB 초기화 완료 (mode={mode}): {deleted}")
 
         # 메모리 상태 초기화
         with _trade_count_lock:
             _last_trade_count = 0
 
-        # 봇 인스턴스의 메모리 데이터도 초기화
+        # 봇 인스턴스의 메모리 데이터도 초기화 (초기화 대상 모드와 같을 때만)
         if bot_instance and hasattr(bot_instance, 'executor'):
             executor = bot_instance.executor
-            with executor._lock:
-                executor.positions.clear()
-                executor.trade_history.clear()
-                executor.cash = executor.initial_capital
-                executor.orders.clear()
+            if getattr(executor, "mode", None) == mode:
+                with executor._lock:
+                    executor.positions.clear()
+                    executor.trade_history.clear()
+                    executor.cash = executor.initial_capital
+                    executor.orders.clear()
 
-        # 대시보드 상태 초기화
-        bot_status["total_equity"] = 0
-        bot_status["cash"] = 0
-        bot_status["positions"] = {}
-        bot_status["daily_pnl"] = 0
-        bot_status["total_pnl"] = 0
-        bot_status["total_trades"] = 0
-        bot_status["win_rate"] = 0
-        bot_status["signals_today"] = []
+        # 대시보드 상태 초기화 — 현재 표시 중인 모드를 초기화한 경우만
+        # (다른 모드를 초기화했으면 화면 숫자는 그대로 둔다)
+        if _current_display_mode() == mode:
+            bot_status["total_equity"] = 0
+            bot_status["cash"] = 0
+            bot_status["positions"] = {}
+            bot_status["daily_pnl"] = 0
+            bot_status["total_pnl"] = 0
+            bot_status["total_trades"] = 0
+            bot_status["win_rate"] = 0
+            bot_status["signals_today"] = []
 
-        _add_activity("reset", "봇 데이터가 초기화되었습니다", "warning")
+        _add_activity("reset", f"{mode_kr} 데이터가 초기화되었습니다", "warning")
 
         # 설정에서 초기 자본금 읽기
         capital = float(current_settings.get("capital", 10_000_000))
 
         return jsonify({
             "success": True,
-            "message": f"초기화 완료. 자본금 {capital:,.0f}원으로 리셋됩니다.",
-            "deleted": deleted
+            "message": f"{mode_kr} 데이터 초기화 완료. 자본금 {capital:,.0f}원으로 리셋됩니다.",
+            "deleted": deleted,
+            "mode": mode,
         })
 
     except Exception as e:
@@ -2881,8 +2909,13 @@ def handle_connect(auth=None):
        TypeError 방지됩니다.
     """
     try:
-        emit("status_update", bot_status)
-        emit("settings_update", current_settings)
+        # ★ 락 보호 스냅샷 (emit 직렬화 중 dict 변경 방지)
+        with _bot_status_lock:
+            _snap = dict(bot_status)
+            if "positions" in _snap:
+                _snap["positions"] = dict(_snap["positions"])
+        emit("status_update", _snap)
+        emit("settings_update", dict(current_settings))
     except Exception as e:
         logger.warning(f"[WebSocket] 연결 시 초기 데이터 전송 실패: {e}")
     logger.info(f"[WebSocket] 클라이언트 연결됨 (sid: {request.sid})")
@@ -2902,7 +2935,12 @@ def handle_disconnect():
 @socketio.on("request_status")
 def handle_request_status():
     """클라이언트가 상태 요청"""
-    emit("status_update", bot_status)
+    # ★ 락 보호 스냅샷
+    with _bot_status_lock:
+        _snap = dict(bot_status)
+        if "positions" in _snap:
+            _snap["positions"] = dict(_snap["positions"])
+    emit("status_update", _snap)
 
 
 # =============================================================================
@@ -3044,6 +3082,14 @@ def _run_bot_thread():
                 bot_status["running"] = False
                 return
 
+            # ── ★ 실거래 자본 동기화 (CRITICAL) ──
+            # 설정 capital과 실제 계좌 잔고가 다르면 포지션 크기 오류
+            try:
+                if hasattr(bot_instance, "_sync_capital_from_broker"):
+                    bot_instance._sync_capital_from_broker()
+            except Exception as sync_err:
+                logger.warning(f"[봇 스레드] 자본 동기화 실패 (계속 진행): {sync_err}")
+
             # ── ★ Phase 6B: 브로커 ↔ DB 포지션 reconcile (이중 매수 방지) ──
             # 봇 크래시 후 재시작 시 DB와 브로커가 어긋날 수 있음
             try:
@@ -3073,12 +3119,14 @@ def _run_bot_thread():
             try:
                 if hasattr(bot_instance, 'db') and bot_instance.db:
                     today_str = datetime.now().strftime("%Y-%m-%d")
+                    # ★ mode 필터 — 현재 봇 모드의 오늘자 신호만 복원
+                    _restore_mode = getattr(bot_instance.executor, "mode", "paper")
                     cursor = bot_instance.db.conn.execute(
                         "SELECT timestamp, symbol, signal_type, confidence, score, "
                         "components_json, reasons_json "
-                        "FROM signals WHERE timestamp LIKE ? "
+                        "FROM signals WHERE timestamp LIKE ? AND mode = ? "
                         "ORDER BY timestamp DESC LIMIT ?",
-                        (f"{today_str}%", _dash_cfg.signals_log_max)
+                        (f"{today_str}%", _restore_mode, _dash_cfg.signals_log_max)
                     )
                     restored_signals = []
                     for row in cursor.fetchall():
@@ -3160,9 +3208,11 @@ def _run_bot_thread():
                     kst_now = datetime.now(timezone(+_td(hours=9)))
                     kst_today = kst_now.strftime("%Y-%m-%d")
                     with DatabaseManager() as db:
+                        # ★ mode 필터 — 현재 봇 모드의 신호만 카운트
+                        _cnt_mode = getattr(bot_instance.executor, "mode", "paper") if bot_instance else "paper"
                         cursor = db.conn.execute(
-                            "SELECT COUNT(*) FROM signals WHERE timestamp LIKE ?",
-                            (f"{kst_today}%",)
+                            "SELECT COUNT(*) FROM signals WHERE timestamp LIKE ? AND mode = ?",
+                            (f"{kst_today}%", _cnt_mode)
                         )
                         today_signals = cursor.fetchone()[0]
                     positions = bot_instance.executor.get_positions()
@@ -3492,8 +3542,19 @@ def _status_broadcaster():
                 except Exception:
                     pass  # DB 조회 실패해도 기본 포지션 정보는 유지
 
-                # ★ numpy/bytes 타입 안전 변환 + 0 나누기 방지
-                capital = float(current_settings.get("capital", 1) or 1)
+                # ★ 총 수익률 기준 자본 — 봇이 시작 시 동기화한 '실제 자본' 사용.
+                #   실거래: _sync_capital_from_broker가 브로커 실잔고로 맞춰둔 값.
+                #   (이전 버그: 설정값(예: 천만원) 기준으로 나눠 실계좌 잔고와
+                #    불일치 → 수익률이 엉뚱하게 표시됨)
+                capital = 0.0
+                try:
+                    if bot_instance is not None and hasattr(bot_instance, "settings"):
+                        capital = float(bot_instance.settings.capital.total_capital)
+                except Exception:
+                    capital = 0.0
+                if capital <= 0:
+                    # 봇 미가동 등으로 못 가져오면 설정값으로 폴백
+                    capital = float(current_settings.get("capital", 1) or 1)
                 equity = float(account.total_equity)
                 bot_status["total_pnl"] = ((equity / capital) - 1) * 100
 
@@ -3579,8 +3640,18 @@ def _status_broadcaster():
                         logger.debug(f"[브로드캐스터] equity 스냅샷 저장 실패: {e}")
                     _last_snapshot_time = now
 
-            # WebSocket으로 전체 상태 브로드캐스트
-            socketio.emit("status_update", bot_status)
+            # ── WebSocket으로 전체 상태 브로드캐스트 ──
+            # ★ 락으로 보호된 스냅샷을 emit — emit 내부의 json 직렬화 도중
+            # 다른 스레드가 bot_status dict 구조를 바꾸면
+            # "RuntimeError: dictionary changed size during iteration" 발생.
+            # 복사본을 보내면 원본이 바뀌어도 안전.
+            with _bot_status_lock:
+                _snapshot = dict(bot_status)
+                if "positions" in _snapshot:
+                    _snapshot["positions"] = dict(_snapshot["positions"])
+                if "signals_today" in _snapshot:
+                    _snapshot["signals_today"] = list(_snapshot["signals_today"])
+            socketio.emit("status_update", _snapshot)
         except Exception as e:
             # ★ 에러를 로그로 남겨야 디버깅 가능
             # 단, broadcaster가 멈추면 안 되므로 try-except는 유지

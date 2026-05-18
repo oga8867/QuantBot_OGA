@@ -208,6 +208,7 @@ class AlpacaExecutor(BaseExecutor):
     def get_positions(self) -> List[Position]:
         """전체 보유 포지션 조��"""
         if not self.client:
+            self._last_positions_call_ok = False
             return []
 
         try:
@@ -225,18 +226,28 @@ class AlpacaExecutor(BaseExecutor):
                     side="long" if p.side == "long" else "short",
                 ))
 
+            self._last_positions_call_ok = True
             return positions
         except Exception as e:
+            self._last_positions_call_ok = False
             logger.error(f"[Alpaca] 포지션 조회 ���패: {e}")
             return []
+
+    def positions_query_succeeded(self) -> bool:
+        return getattr(self, "_last_positions_call_ok", True)
+
+    def account_query_succeeded(self) -> bool:
+        return getattr(self, "_last_account_call_ok", True)
 
     def get_account(self) -> AccountInfo:
         """계좌 정보 조회"""
         if not self.client:
+            self._last_account_call_ok = False
             return AccountInfo()
 
         try:
             account = self.client.get_account()
+            self._last_account_call_ok = True
             return AccountInfo(
                 total_equity=float(account.equity),
                 cash=float(account.cash),
@@ -246,6 +257,7 @@ class AlpacaExecutor(BaseExecutor):
                 currency="USD",
             )
         except Exception as e:
+            self._last_account_call_ok = False
             logger.error(f"[Alpaca] ��좌 조회 실패: {e}")
             return AccountInfo()
 

@@ -87,7 +87,8 @@ class DualExecutor(BaseExecutor):
         alpaca_api_key: Optional[str] = None,
         alpaca_secret_key: Optional[str] = None,
         # 공통
-        paper: bool = True
+        paper: bool = True,
+        db=None,
     ):
         """
         Parameters:
@@ -97,15 +98,18 @@ class DualExecutor(BaseExecutor):
             alpaca_api_key: Alpaca API Key (None이면 환경변수)
             alpaca_secret_key: Alpaca Secret Key
             paper: True=모의매매, False=실거래
+            db: DatabaseManager — KIS 체결 시 trades 테이블에 자동 기록
         """
         super().__init__(name="dual", paper=paper)
+        self.db = db
 
         # ── 개별 실행기 생성 ──
         self.kr_executor = KISExecutor(
             app_key=kis_app_key,
             app_secret=kis_app_secret,
             account=kis_account,
-            paper=paper
+            paper=paper,
+            db=db,  # ★ KIS도 DB 기록 가능하게
         )
         self.us_executor = AlpacaExecutor(
             api_key=alpaca_api_key,
@@ -116,6 +120,51 @@ class DualExecutor(BaseExecutor):
         # 연결 상태 추적
         self.kr_connected = False
         self.us_connected = False
+
+    def positions_query_succeeded(self) -> bool:
+        """
+        ★ Phase 10: 두 executor 모두 성공해야 True 반환
+        한쪽이라도 실패하면 caller가 매수 보류 (이중 매수 방지)
+        """
+        kr_ok = self.kr_executor.positions_query_succeeded() if self.kr_connected else True
+        us_ok = self.us_executor.positions_query_succeeded() if self.us_connected else True
+        return kr_ok and us_ok
+
+    def account_query_succeeded(self) -> bool:
+        """두 executor 모두 성공해야 True"""
+        kr_ok = self.kr_executor.account_query_succeeded() if self.kr_connected else True
+        us_ok = self.us_executor.account_query_succeeded() if self.us_connected else True
+        return kr_ok and us_ok
+
+    def get_current_price(self, symbol: str):
+        """
+        ★ Phase 10: 종목 시장에 따라 적절한 executor에 라우팅
+        run_bot._execute_buy의 5% 갭 검증이 dual에서도 작동
+        """
+        from utils.market import is_us_stock
+        if is_us_stock(symbol):
+            # Alpaca: get_latest_quote 등 (구현되어 있으면)
+            if hasattr(self.us_executor, "get_current_price"):
+                return self.us_executor.get_current_price(symbol)
+            return None
+        else:
+            return self.kr_executor.get_current_price(symbol)
+
+    def cancel_order(self, order_id: str, original_ord_dvsn: Optional[str] = None) -> bool:
+        """★ Phase 10: original_ord_dvsn을 KIS로 전달 (지정가 취소 실패 방지)"""
+        if self.kr_connected:
+            try:
+                if self.kr_executor.cancel_order(order_id, original_ord_dvsn=original_ord_dvsn):
+                    return True
+            except Exception as e:
+                logger.warning(f"[Dual] KIS 취소 시도 실패: {e}")
+        if self.us_connected:
+            try:
+                if self.us_executor.cancel_order(order_id):
+                    return True
+            except Exception as e:
+                logger.warning(f"[Dual] Alpaca 취소 시도 실패: {e}")
+        return False
 
     def connect(self) -> bool:
         """
@@ -218,30 +267,6 @@ class DualExecutor(BaseExecutor):
         result = executor.submit_order(order)
         self.orders.append(result)
         return result
-
-    def cancel_order(self, order_id: str) -> bool:
-        """
-        주문 취소 — 양쪽 실행기에서 시도
-
-        order_id로는 어느 시장인지 알 수 없으므로
-        양쪽 모두에 취소를 시도합니다.
-        """
-        cancelled = False
-        if self.kr_connected:
-            try:
-                if self.kr_executor.cancel_order(order_id):
-                    cancelled = True
-            except Exception:
-                pass
-
-        if not cancelled and self.us_connected:
-            try:
-                if self.us_executor.cancel_order(order_id):
-                    cancelled = True
-            except Exception:
-                pass
-
-        return cancelled
 
     def get_order_status(self, order_id: str) -> OrderStatus:
         """주문 상태 조회 — 양쪽에서 시도"""

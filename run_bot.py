@@ -122,7 +122,11 @@ class QuantBot:
 
         # 안전장치 (실거래 시 특히 중요)
         capital = settings.capital.total_capital
-        max_order_val = capital * 0.20
+        # ★ 최대 주문 금액: 설정값 우선, 0이면 자동(자본의 20%)
+        # _max_order_is_auto 플래그 — 자본 동기화 시 자동 재계산 여부 판단용
+        _configured_max_order = getattr(settings.risk, "max_order_value", 0) or 0
+        self._max_order_is_auto = (_configured_max_order <= 0)
+        max_order_val = _configured_max_order if not self._max_order_is_auto else capital * 0.20
         min_order_val = capital * 0.001
 
         self.safety = SafetyGuard(
@@ -132,7 +136,7 @@ class QuantBot:
                 max_daily_loss_pct=settings.risk.max_daily_loss if hasattr(settings.risk, 'max_daily_loss') else 0.03,
                 max_order_pct=settings.risk.max_position_size if hasattr(settings.risk, 'max_position_size') else 0.10,
                 max_positions=10,
-                max_position_weight=0.20,
+                max_position_weight=settings.risk.max_position_size if hasattr(settings.risk, 'max_position_size') else 0.20,
                 max_daily_trades=50,
                 consecutive_loss_limit=5,
                 order_delay_sec=3 if live else 0,
@@ -227,13 +231,15 @@ class QuantBot:
             self.logger.info(
                 "[실행기] 듀얼 마켓 모드 — KIS(한국) + Alpaca(미국) 동시 운용"
             )
-            return DualExecutor(paper=not live)
+            return DualExecutor(paper=not live, db=self.db)
         elif broker == "alpaca":
             from executor.alpaca_executor import AlpacaExecutor
             return AlpacaExecutor(paper=not live)
         elif broker == "kis":
             from executor.kis_executor import KISExecutor
-            return KISExecutor(paper=not live)
+            # ★ Phase 10: DB 주입 → KIS 체결 시 자동으로 trades 테이블에 기록
+            # 그러지 않으면 live 거래가 대시보드 PnL/이력에 안 보임
+            return KISExecutor(paper=not live, db=self.db)
         else:
             # DB를 PaperExecutor에 주입 → 거래 이력/포지션이 DB에 영속 저장됨
             # 봇 재시작 시 connect()에서 자동으로 이전 상태 복원
@@ -254,6 +260,11 @@ class QuantBot:
         if not self.executor.connect():
             self.logger.error("브로커 연결 실패! 종료합니다.")
             return
+
+        # ── ★ 실거래 자본 동기화 (CRITICAL) ──
+        # 설정 파일의 capital과 실제 계좌 잔고가 다르면 포지션 크기가 잘못 계산됨.
+        # 실거래 모드에서는 반드시 실제 계좌 잔고를 진실의 원천으로 사용.
+        self._sync_capital_from_broker()
 
         # ── ★ Phase 6B: 브로커 ↔ DB 포지션 reconciliation ──
         # 봇 크래시 후 재시작 시 DB 불일치를 잡아 이중 매수를 방지합니다.
@@ -333,6 +344,18 @@ class QuantBot:
         """봇 중지"""
         self.running = False
         self.scheduler.stop()
+
+        # ★ Phase 11 BUG-6 FIX: 종료 직전 모든 ExitManager state를 DB에 flush
+        # 트레일링 스탑 최신값이 디스크에 영속화되어 재시작 시 손익 보호 유지
+        try:
+            for sym in list(self.exit_manager.states.keys()):
+                try:
+                    self._save_exit_state(sym)
+                except Exception as e:
+                    self.logger.debug(f"[종료 flush] {sym}: {e}")
+        except Exception as e:
+            self.logger.warning(f"[종료] ExitManager flush 실패: {e}")
+
         self.notifier.send_message("🛑 <b>퀀트봇 종료</b>")
         # 디스코드 종료 알림
         account = self.executor.get_account()
@@ -469,6 +492,94 @@ class QuantBot:
         except Exception as e:
             self.logger.warning(f"[쿨다운 복원] DB에서 복원 실패 (무시): {e}")
 
+    def _sync_capital_from_broker(self):
+        """
+        실거래 모드: 실제 브로커 계좌 잔고로 자본금 동기화 (CRITICAL)
+
+        ⚠️ 왜 필요한가:
+          설정 파일(user_settings.json)의 capital이 실제 계좌 잔고와 다르면
+          PositionSizer와 SafetyGuard가 잘못된 자본 기준으로 매매 크기를 계산.
+          예: 설정 ₩1,000만 / 실제 ₩400만 → 모든 리스크 한도가 2.5배 헐거워짐
+              → 단일 종목에 실제 자본의 25%가 들어가는데 10%로 오인
+
+        정책:
+          - paper 모드: 설정된 가상 자본 유지 (실제 계좌 없음)
+          - live 모드: 브로커의 total_equity(총평가금액)를 진실의 원천으로 사용
+          - 계좌 조회 실패 시: 설정값 유지 + 경고 (자본 0으로 만들지 않음)
+        """
+        # paper 모드는 가상 자본 사용 — 동기화 불필요
+        if getattr(self.executor, "paper", True):
+            return
+
+        try:
+            account = self.executor.get_account()
+            # 계좌 조회 자체가 실패했으면 설정값 유지 (0으로 덮어쓰면 매매 불가)
+            if hasattr(self.executor, "account_query_succeeded"):
+                if not self.executor.account_query_succeeded():
+                    self.logger.warning(
+                        "[자본 동기화] 계좌 조회 실패 → 설정값 유지 "
+                        f"(₩{self.settings.capital.total_capital:,.0f})"
+                    )
+                    return
+
+            real_capital = float(account.total_equity)
+            if real_capital <= 0:
+                self.logger.warning(
+                    f"[자본 동기화] 계좌 평가액이 {real_capital} → 설정값 유지. "
+                    f"실거래 API 신청/입금 여부 확인 필요"
+                )
+                return
+
+            configured = float(self.settings.capital.total_capital)
+            diff_pct = abs(real_capital - configured) / max(configured, 1.0) * 100
+
+            if diff_pct > 1.0:
+                self.logger.warning(
+                    f"[자본 동기화] ⚠️ 설정 자본 ₩{configured:,.0f} ≠ "
+                    f"실제 계좌 ₩{real_capital:,.0f} (차이 {diff_pct:.0f}%) "
+                    f"→ 실제 계좌 값으로 매매 크기 계산"
+                )
+                try:
+                    self.notifier.send_message(
+                        f"💰 자본 동기화\n"
+                        f"설정: ₩{configured:,.0f}\n"
+                        f"실제: ₩{real_capital:,.0f}\n"
+                        f"→ 실제 잔고 기준으로 매매합니다."
+                    )
+                except Exception:
+                    pass
+            else:
+                self.logger.info(
+                    f"[자본 동기화] 실제 계좌 ₩{real_capital:,.0f} 확인"
+                )
+
+            # 실제 자본으로 갱신
+            self.settings.capital.total_capital = real_capital
+            self.position_sizer.capital = real_capital
+            self.safety.capital = real_capital
+
+            # ★ 주문 한도도 갱신:
+            #   - max_order_value가 '자동'(설정 0)이면 새 자본의 20%로 재계산
+            #     (이전 버그: capital만 갱신하고 config.max_order_value는 stale)
+            #   - 사용자가 절대값을 명시했으면 그 값 유지 (자본과 무관)
+            #   - min_order_value는 항상 자본 비례 재계산
+            try:
+                if getattr(self, "_max_order_is_auto", True):
+                    self.safety.config.max_order_value = real_capital * 0.20
+                self.safety.config.min_order_value = real_capital * 0.001
+                self.logger.info(
+                    f"[자본 동기화] 주문 한도 갱신 — "
+                    f"최대 ₩{self.safety.config.max_order_value:,.0f} / "
+                    f"최소 ₩{self.safety.config.min_order_value:,.0f}"
+                )
+            except Exception as e:
+                self.logger.warning(f"[자본 동기화] 주문 한도 갱신 실패: {e}")
+
+        except Exception as e:
+            self.logger.error(
+                f"[자본 동기화] 실패 (설정값 유지): {e}"
+            )
+
     def _reconcile_with_broker(self):
         """
         브로커 잔고와 DB 포지션을 비교하여 불일치 감지 + 자동 정렬
@@ -496,6 +607,17 @@ class QuantBot:
         try:
             mode = getattr(self.executor, "mode", "paper")
             broker_positions = self.executor.get_positions()
+
+            # ★ CRITICAL: API 호출이 실패했으면 reconcile 중단
+            # 이전 버그: get_positions가 API 실패 시 [] 반환 → 모든 DB 포지션이 broker-only로
+            # 판단되어 DELETE FROM positions → 실제 포지션 기록 전부 소실
+            if not self.executor.positions_query_succeeded():
+                self.logger.error(
+                    "[Reconcile] 브로커 API 실패 — DB 보호를 위해 reconcile 중단. "
+                    "다음 분석 사이클에서 재시도."
+                )
+                return
+
             db_positions = self.db.load_positions(mode=mode)
 
             broker_map = {p.symbol: p for p in broker_positions}
@@ -538,34 +660,58 @@ class QuantBot:
                 except Exception as e:
                     self.logger.error(f"[Reconcile] {sym} DB 삭제 실패: {e}")
 
-            # 2) 브로커에만 있는 포지션 (DB 누락) → DB에 추가
+            # 2) 브로커에만 있는 포지션 (DB 누락) → DB에 추가 + ExitManager 등록
             for sym in broker_only:
                 bp = broker_map[sym]
                 self.logger.warning(
                     f"[Reconcile] 브로커-only: {sym} (브로커: {bp.quantity}주 @ "
-                    f"₩{bp.avg_price:,.0f}, DB: 없음) → DB에 추가"
+                    f"₩{bp.avg_price:,.0f}, DB: 없음) → DB에 추가 + 자동청산 등록"
                 )
                 alert_lines.append(
                     f"• {sym}: 브로커 {bp.quantity}주 @ ₩{bp.avg_price:,.0f}, "
                     f"DB 없음 → 복원"
                 )
+                # ── ATR 추정 (DB에 없으므로 진입가 기반 보수적 추정) ──
+                # 정확한 ATR이 없으면 진입가의 2.5%를 ATR로 가정 (한국 주식 평균 변동성)
+                est_atr = float(bp.avg_price) * 0.025
                 try:
                     self.db.update_position(
                         symbol=sym,
                         quantity=int(bp.quantity),
                         avg_price=float(bp.avg_price),
                         current_price=float(bp.current_price),
-                        position_type="",
-                        position_type_en="",
-                        target_price=0,
-                        stop_price=0,
+                        position_type="스윙",
+                        position_type_en="swing",
+                        target_price=round(float(bp.avg_price) + est_atr * 2.0 * 2.0, 2),
+                        stop_price=round(float(bp.avg_price) - est_atr * 2.0, 2),
                         reasons_json="[]",
-                        holding_period="",
+                        holding_period="복원됨",
                         bought_at="",
                         mode=mode,
                     )
                 except Exception as e:
                     self.logger.error(f"[Reconcile] {sym} DB 추가 실패: {e}")
+
+                # ── ★ Phase 12 FIX: ExitManager에도 등록 (자동 손절/익절 보장) ──
+                # 이전 버그: DB만 추가하고 ExitManager 미등록 → 복원된 포지션이
+                # 영원히 자동 청산 안 됨 (손절/익절/트레일링 전부 미작동)
+                try:
+                    if sym not in self.exit_manager.states:
+                        self.exit_manager.register_entry(
+                            symbol=sym,
+                            entry_price=float(bp.avg_price),
+                            atr=est_atr,
+                            atr_stop_mult=2.0,
+                            rr_ratio=2.0,
+                            holding_days_max=30,
+                        )
+                        self.logger.info(
+                            f"[Reconcile] {sym} ExitManager 등록 완료 "
+                            f"(추정 ATR ₩{est_atr:,.0f}, 손절 ₩{float(bp.avg_price) - est_atr*2.0:,.0f})"
+                        )
+                        self._save_exit_state(sym)
+                except Exception as e:
+                    self.logger.error(f"[Reconcile] {sym} ExitManager 등록 실패: {e}")
 
             # 3) 수량 불일치 → 브로커 기준으로 정렬
             for sym, db_qty, broker_qty in qty_diff:
@@ -696,32 +842,29 @@ class QuantBot:
             self.logger.warning(f"[ExitManager 복원] 실패 (무시, 신규로 시작): {e}")
 
     def _save_exit_state(self, symbol: str):
-        """ExitManager 상태를 DB positions 테이블에 동기화"""
+        """
+        ExitManager 상태를 DB positions 테이블에 동기화
+
+        ★ 수정: mode 필터 + DB 락 적용 (이전엔 raw conn + symbol-only WHERE)
+        positions 테이블은 UNIQUE(symbol, mode)이므로 mode 없이 UPDATE하면
+        다른 모드(paper↔live)의 같은 종목 행을 잘못 덮어쓸 수 있었음.
+        """
         if not self.db:
             return
         state_dict = self.exit_manager.get_state_dict(symbol)
         if not state_dict:
             return
         try:
-            # positions 테이블의 ExitManager 필드 업데이트
-            self.db.conn.execute(
-                """UPDATE positions SET
-                    entry_atr = ?, current_stop = ?, highest_since_entry = ?,
-                    partial_sold_pct = ?, target_1 = ?, target_2 = ?,
-                    stop_price = ?
-                WHERE symbol = ?""",
-                (
-                    float(state_dict["entry_atr"]),
-                    float(state_dict["current_stop"]),
-                    float(state_dict["highest_since_entry"]),
-                    float(state_dict["partial_sold_pct"]),
-                    float(state_dict["target_1"]),
-                    float(state_dict["target_2"]),
-                    float(state_dict["current_stop"]),  # stop_price도 동기화
-                    symbol,
-                )
+            self.db.update_exit_state(
+                symbol=symbol,
+                mode=getattr(self.executor, "mode", "paper"),
+                entry_atr=state_dict["entry_atr"],
+                current_stop=state_dict["current_stop"],
+                highest_since_entry=state_dict["highest_since_entry"],
+                partial_sold_pct=state_dict["partial_sold_pct"],
+                target_1=state_dict["target_1"],
+                target_2=state_dict["target_2"],
             )
-            self.db.conn.commit()
         except Exception as e:
             self.logger.debug(f"[ExitManager 동기화] {symbol} 실패 (무시): {e}")
 
@@ -1071,14 +1214,11 @@ class QuantBot:
         removed = []
 
         for sym in list(discovered):
-            # DB에서 최근 신호 조회
+            # DB에서 최근 신호 조회 (★ mode 필터 — paper/live 신호 섞임 방지)
             try:
-                cursor = self.db.conn.execute(
-                    "SELECT signal_type FROM signals WHERE symbol = ? "
-                    "ORDER BY timestamp DESC LIMIT ?",
-                    (sym, limit)
-                )
-                recent_signals = [row["signal_type"] for row in cursor.fetchall()]
+                _sig_mode = getattr(self.executor, "mode", "paper")
+                recent_rows = self.db.get_signals(symbol=sym, limit=limit, mode=_sig_mode)
+                recent_signals = [r.get("signal_type", "") for r in recent_rows]
 
                 # 최근 N개가 전부 HOLD면 제거
                 if len(recent_signals) >= limit and all(s == "HOLD" for s in recent_signals):
@@ -1441,11 +1581,26 @@ class QuantBot:
                          or self._halt_check_result.can_trade_exit)
                 )
                 if can_exit_now:
-                    current_price = float(df_analyzed["Close"].iloc[-1])
+                    # ★ 실시간 시세 우선 — 손절/익절을 현재가에 즉시 반응시킴.
+                    #   보유(ExitManager 등록) 종목만 조회해 불필요한 API 호출 방지.
+                    #   실패 시 일봉 종가로 자동 fallback (봇 중단 방지).
+                    rt_price = None
+                    if self.exit_manager.get_state_dict(symbol):
+                        rt_price = self._get_realtime_price(symbol)
+                    current_price = (rt_price if rt_price
+                                     else float(df_analyzed["Close"].iloc[-1]))
                     exit_decision = self.exit_manager.evaluate(symbol, current_price)
-                    if exit_decision.should_exit:
-                        # ExitManager 상태 업데이트 (트레일링 갱신 등)
+
+                    # ★ Phase 11 BUG-5 FIX: 매 evaluate마다 trailing/highest를 DB에 영속화
+                    # 이전 버그: should_exit=True일 때만 저장 → 청산 안 한 사이의 트레일링 진행이
+                    # 봇 재시작 시 사라져서 멀티데이 추세에서 손익 보호 무력화
+                    # 수정: 매 분석마다 저장 (가벼운 UPSERT)
+                    try:
                         self._save_exit_state(symbol)
+                    except Exception as save_err:
+                        self.logger.debug(f"[ExitState 저장] {symbol}: {save_err}")
+
+                    if exit_decision.should_exit:
                         self.logger.info(
                             f"[자동 청산] {symbol}: {exit_decision.reason.value} | "
                             f"{exit_decision.detail}"
@@ -1547,6 +1702,87 @@ class QuantBot:
         if results:
             self.notifier.send_daily_report(results)
 
+    def _ensure_kis_quote_client(self):
+        """
+        KIS 실시간 시세 전용 클라이언트 (lazy 생성).
+
+        모의거래 모드에서는 executor가 PaperExecutor라 KIS 연결이 없으므로,
+        실시간 시세 조회용 KIS 클라이언트를 별도로 1개 둡니다.
+        시세 조회는 체결과 무관하므로 모의/실거래 자격증명 모두 동작하며,
+        토큰은 캐시 파일을 공유하므로 추가 발급이 일어나지 않습니다.
+
+        실패(자격증명 없음/연결 실패) 시 None을 반환하고, 한 번 실패하면
+        다시 시도하지 않아 매 사이클이 느려지지 않습니다.
+        """
+        if getattr(self, "_kis_quote_client", None) is not None:
+            return self._kis_quote_client
+        if getattr(self, "_kis_quote_client_failed", False):
+            return None
+        try:
+            import os
+            app_key = os.environ.get("KIS_APP_KEY", "")
+            app_secret = os.environ.get("KIS_APP_SECRET", "")
+            if not app_key or not app_secret:
+                self.logger.info("[실시간시세] KIS 자격증명 없음 → 일봉 종가로 대체")
+                self._kis_quote_client_failed = True
+                return None
+            from executor.kis_executor import KISExecutor
+            paper = os.environ.get("KIS_PAPER", "true").lower() in ("true", "1", "yes")
+            client = KISExecutor(paper=paper)
+            if client.connect():
+                self._kis_quote_client = client
+                self.logger.info(
+                    f"[실시간시세] KIS 시세 클라이언트 준비 완료 "
+                    f"({'모의' if paper else '실거래'} 도메인)"
+                )
+                return client
+            self.logger.warning(
+                "[실시간시세] KIS 시세 클라이언트 연결 실패 → 일봉 종가로 대체"
+            )
+            self._kis_quote_client_failed = True
+            return None
+        except Exception as e:
+            self.logger.warning(
+                f"[실시간시세] KIS 시세 클라이언트 생성 실패: {e} → 일봉 종가로 대체"
+            )
+            self._kis_quote_client_failed = True
+            return None
+
+    def _get_realtime_price(self, symbol: str):
+        """
+        한국 주식의 KIS 실시간 시세(~1초 지연)를 반환합니다.
+
+        - 실거래(KIS/dual): executor 자체가 시세를 제공 → 그대로 사용
+        - 모의거래: 시세 전용 KIS 클라이언트(_ensure_kis_quote_client) 사용
+        - 미국 주식 / 조회 실패: None 반환 → 호출자가 일봉 종가로 fallback
+
+        실거래·모의거래 모두 동일하게 실시간 시세를 받게 하는 단일 진입점입니다.
+        """
+        # 미국 종목은 KIS 시세 대상이 아님 → fallback
+        try:
+            from utils.market import is_us_stock
+            if is_us_stock(symbol):
+                return None
+        except Exception:
+            pass
+
+        # 실거래 KIS/dual executor는 자체적으로 get_current_price 보유.
+        # PaperExecutor는 없으므로 시세 전용 KIS 클라이언트를 사용.
+        if hasattr(self.executor, "get_current_price"):
+            client = self.executor
+        else:
+            client = self._ensure_kis_quote_client()
+
+        if client is None:
+            return None
+        try:
+            price = client.get_current_price(symbol)
+            if price and float(price) > 0:
+                return float(price)
+        except Exception as e:
+            self.logger.debug(f"[실시간시세] {symbol} 조회 실패: {e}")
+        return None
+
     def _execute_buy(self, symbol: str, df, signal,
                      ensemble_signal=None, module_scores=None,
                      size_multiplier: float = 1.0):
@@ -1557,27 +1793,37 @@ class QuantBot:
             size_multiplier: 포지션 크기 배수 (적응형 임계값에서 0.5~1.0 전달)
                              변동성이 높으면 1.0 미만으로 포지션 축소
         """
-        # ── 이미 보유 중인 종목이면 추가 매수 건너뛰기 ──
-        # 같은 종목을 반복 매수하면 포지션이 무한 누적됩니다.
-        # 추후 "피라미딩(추가 매수)" 전략이 필요하면 이 로직을 수정하세요.
-        existing_positions = self.executor.get_positions()
-
-        # ★ CRITICAL: 포지션 조회 자체가 실패했으면 "보유 없음"인지 알 수 없으므로 매수 보류
-        # 이전 버그: API 실패 시 []를 반환 → "보유 없음"으로 오인 → 같은 종목 이중 매수
-        if not self.executor.positions_query_succeeded():
-            self.logger.error(
-                f"[매수 보류] {symbol}: 브로커 포지션 조회 실패 — "
-                f"보유 여부 불확실하여 새 매수 보류 (이중 매수 방지)"
+        # ── 최대 낙폭(MDD) 한도 초과 시 신규 매수 자동 중단 ──
+        # _check_risk가 MDD > max_drawdown 감지 시 이 래치를 켠다.
+        # 손절·매도는 막지 않으므로 보유 포지션은 정상 청산 가능.
+        if getattr(self, "_risk_halt_new_buys", False):
+            self.logger.warning(
+                f"[낙폭 차단] {symbol}: 최대 낙폭 한도 초과 — 신규 매수 중단 상태"
             )
             return
 
-        for pos in existing_positions:
-            if pos.symbol == symbol:
-                self.logger.info(
-                    f"[매수 스킵] {symbol}: 이미 {pos.quantity}주 보유 중 "
-                    f"(평균가 {pos.avg_price:,.0f})"
-                )
-                return
+        # ── 추가 매수(피라미딩) 허용 — 종목당 한도 안에서 ──
+        # 이미 보유 중이어도 매수 진행. SafetyGuard가 '기존 보유분 + 신규 주문'이
+        # 종목당 최대 비중(max_position_weight)을 넘지 않도록 수량을 자동 조정/거부.
+        existing_positions = self.executor.get_positions()
+
+        # ★ CRITICAL: 포지션 조회 자체가 실패했으면 보유 현황을 알 수 없으므로 매수 보류
+        # 이전 버그: API 실패 시 []를 반환 → "보유 없음"으로 오인 → 한도 초과 매수 위험
+        if not self.executor.positions_query_succeeded():
+            self.logger.error(
+                f"[매수 보류] {symbol}: 브로커 포지션 조회 실패 — "
+                f"보유 현황 불확실하여 매수 보류 (한도 초과 방지)"
+            )
+            return
+
+        already_held = any(
+            getattr(p, "symbol", None) == symbol and getattr(p, "quantity", 0) > 0
+            for p in existing_positions
+        )
+        if already_held:
+            self.logger.info(
+                f"[추가 매수] {symbol}: 이미 보유 중 — 종목 한도 내에서 추가 매수 시도"
+            )
 
         # ── ★ 엄격 화이트리스트 모드: 사용자 지정 종목만 매수 허용 ──
         # 자동 발굴 종목이 분석되어 BUY 신호가 와도 매수 차단
@@ -1620,23 +1866,34 @@ class QuantBot:
         cached_price = float(df["Close"].iloc[-1])
         atr = float(df["ATR"].iloc[-1]) if "ATR" in df.columns else cached_price * 0.02
 
+        # ★ Phase 12: 가격 유효성 가드 — 0/NaN/음수면 매수 불가
+        # 데이터 소스 오류 시 0 division / NaN 전파 방지
+        import math
+        if not (cached_price > 0) or math.isnan(cached_price) or math.isinf(cached_price):
+            self.logger.warning(
+                f"[매수 취소] {symbol}: 유효하지 않은 가격 {cached_price} "
+                f"(데이터 소스 오류 가능) → 매수 보류"
+            )
+            return
+
         # ★ CRITICAL: 분석 시점 가격이 아닌 실시간 가격으로 사이징
         # 이전 버그: 분석(09:05) → 매수 실행(09:10) 사이 갭으로 포지션 크기 오류
         # 5% 이상 차이나면 신호 신선도가 의심되므로 매수 보류
         price = cached_price
         try:
-            if hasattr(self.executor, "get_current_price"):
-                live_price = self.executor.get_current_price(symbol)
-                if live_price and live_price > 0:
-                    deviation = abs(live_price - cached_price) / cached_price
-                    if deviation > 0.05:
-                        self.logger.warning(
-                            f"[매수 보류] {symbol}: 분석가 {cached_price:,.0f} vs "
-                            f"실시간 {live_price:,.0f} (차이 {deviation*100:.1f}%, 한도 5%) "
-                            f"— 빠른 가격 변동으로 신호 부정확 → 다음 사이클에서 재평가"
-                        )
-                        return
-                    price = live_price  # 실시간 가격으로 사이징/주문
+            # ★ 실시간 시세 우선 (모의·실거래 공통) — _get_realtime_price가
+            #   실거래는 executor, 모의거래는 KIS 시세 클라이언트로 라우팅.
+            live_price = self._get_realtime_price(symbol)
+            if live_price and live_price > 0:
+                deviation = abs(live_price - cached_price) / cached_price
+                if deviation > 0.05:
+                    self.logger.warning(
+                        f"[매수 보류] {symbol}: 분석가 {cached_price:,.0f} vs "
+                        f"실시간 {live_price:,.0f} (차이 {deviation*100:.1f}%, 한도 5%) "
+                        f"— 빠른 가격 변동으로 신호 부정확 → 다음 사이클에서 재평가"
+                    )
+                    return
+                price = live_price  # 실시간 가격으로 사이징/주문
         except Exception as e:
             self.logger.debug(f"[매수] 실시간 가격 조회 실패 (캐시 가격 사용): {e}")
 
@@ -1645,12 +1902,41 @@ class QuantBot:
             f"신호강도={signal.strength:.2f}"
         )
 
+        # ── Kelly 사이징 통계 (sizing_method이 'kelly'일 때만) ──
+        # 닫힌 거래가 kelly_min_trades 이상 쌓였을 때만 Kelly 통계를 넘긴다.
+        # 부족하면 통계 0 → calculate()가 fixed로 폴백하되, 이전과 달리
+        # '조용히'가 아니라 로그를 남긴다.
+        kelly_win_rate = kelly_avg_win = kelly_avg_loss = 0.0
+        if self.settings.risk.sizing_method == "kelly" and self.db is not None:
+            try:
+                _kmode = getattr(self.executor, "mode", "paper")
+                _kstats = self.db.get_kelly_stats(mode=_kmode)
+                _kn = _kstats.get("sample_size", 0)
+                _kmin = getattr(self.settings.risk, "kelly_min_trades", 20)
+                if _kn >= _kmin:
+                    kelly_win_rate = _kstats.get("win_rate", 0.0)
+                    kelly_avg_win = _kstats.get("avg_win", 0.0)
+                    kelly_avg_loss = _kstats.get("avg_loss", 0.0)
+                    self.logger.info(
+                        f"[Kelly] 거래이력 {_kn}건 (≥{_kmin}) → Kelly 적용 "
+                        f"(승률 {kelly_win_rate*100:.0f}%)"
+                    )
+                else:
+                    self.logger.info(
+                        f"[Kelly] 거래이력 부족 ({_kn}/{_kmin}건) → fixed 사이징 사용"
+                    )
+            except Exception as e:
+                self.logger.debug(f"[Kelly] 통계 조회 실패 → fixed 사용: {e}")
+
         # 포지션 사이징
         pos_size = self.position_sizer.calculate(
             price=price,
             atr=atr,
             method=self.settings.risk.sizing_method,
             confidence=signal.strength,
+            win_rate=kelly_win_rate,
+            avg_win=kelly_avg_win,
+            avg_loss=kelly_avg_loss,
             symbol=symbol,  # ★ 환율 변환: USD 종목이면 KRW 환산 후 사이징
         )
 
@@ -1794,80 +2080,116 @@ class QuantBot:
         )
 
         if order.status.value == "filled":
+            # ★ Phase 12 FIX: 실제 체결 수량 사용 (KIS 부분 체결 대응)
+            # 이전 버그: pos_size.shares(주문량)로 DB/알림/SafetyGuard 기록 →
+            # KIS가 5/10주만 체결하면 DB엔 10주, 실제 5주 → 불일치
+            # order.filled_quantity는 KISExecutor._poll_fill_and_record가 실제 체결분으로 설정.
+            # paper executor는 항상 전량 체결이므로 filled_quantity=0일 수 있음 → fallback
+            actual_qty = order.filled_quantity if order.filled_quantity > 0 else pos_size.shares
+            actual_price = order.filled_price if order.filled_price and order.filled_price > 0 else price
+
+            if actual_qty != pos_size.shares:
+                self.logger.warning(
+                    f"[부분 체결] {symbol}: 주문 {pos_size.shares}주 → 실제 체결 {actual_qty}주"
+                )
+
             self.logger.info(
-                f"[매수 체결] {symbol} {pos_size.shares}주 @ {price:.2f}"
+                f"[매수 체결] {symbol} {actual_qty}주 @ {actual_price:.2f}"
             )
-            # 알림 금액은 KRW 기준 (USD 종목이면 환산)
-            total_krw = to_krw(symbol, pos_size.shares * price)
-            self.notifier.send_trade_executed(symbol, "BUY", pos_size.shares, price, total_krw)
-            self.discord.send_trade_executed(symbol, "BUY", pos_size.shares, price, total_krw)
+            # 알림 금액은 KRW 기준 (USD 종목이면 환산) — 실제 체결분 기준
+            total_krw = to_krw(symbol, actual_qty * actual_price)
+            self.notifier.send_trade_executed(symbol, "BUY", actual_qty, actual_price, total_krw)
+            self.discord.send_trade_executed(symbol, "BUY", actual_qty, actual_price, total_krw)
             # DB 저장은 paper_executor._execute_order() 내부에서 이미 처리됨
-            # 안전장치에 거래 기록
+            # 안전장치에 거래 기록 (실제 체결분 기준)
             self.safety.record_trade(symbol, "BUY", value=total_krw)
 
-            # ── 포지션 유형 분류 + 목표가/손절가 계산 ──
+            # ── 포지션 메타데이터 준비 (예외 안 나는 단순 dict 접근) ──
+            # ★ 사전 분류 결과 재사용 (사용자 토글 반영됨)
+            pos_info = pos_info_pre or {
+                "position_type": "스윙", "position_type_en": "swing",
+                "holding_period": "1~4주", "atr_stop_multiplier": 2.0,
+                "rr_ratio": 2.0, "classification_reason": "기본값"
+            }
+            # .get()으로 안전 접근 — 키 누락 시에도 예외 없이 기본값
+            type_atr_mult = pos_info.get("atr_stop_multiplier", 2.0)
+            type_rr = pos_info.get("rr_ratio", 2.0)
+            holding_days_max = {"단타": 5, "스윙": 30, "장기": 180}.get(
+                pos_info.get("position_type", "스윙"), 30
+            )
+
+            # ── ★ 1단계: ExitManager 등록 (최우선 — 자동 손절 즉시 보장) ──
+            # 이전 버그: 분류/DB 작업과 한 try 블록 → DB 오류 시 register_entry에
+            # 도달 못 함 → 브로커엔 포지션 있는데 ExitManager엔 없음 → 손절 안 됨.
+            # 수정: register_entry를 별도 try로 분리하고 DB 작업보다 먼저 실행.
+            try:
+                if symbol in self.exit_manager.states:
+                    # ★ 추가 매수(피라미딩) — 기존 손절/트레일링 상태를 그대로 유지.
+                    #   register_entry를 다시 부르면 손절선·트레일링·부분익절
+                    #   진행이 리셋되므로, 이미 등록된 종목은 건너뛴다 (A안).
+                    self.logger.info(
+                        f"[추가 매수] {symbol}: ExitManager 기존 손절 상태 유지 "
+                        f"(첫 진입 기준 손절선 보존)"
+                    )
+                else:
+                    self.exit_manager.register_entry(
+                        symbol=symbol,
+                        entry_price=actual_price,  # ★ 실제 체결가 기준 손절/익절
+                        atr=atr,
+                        atr_stop_mult=type_atr_mult,
+                        rr_ratio=type_rr,
+                        holding_days_max=holding_days_max,
+                    )
+            except Exception as e:
+                # ExitManager 등록 실패는 CRITICAL — 자동 손절이 안 되므로 경고 강조
+                self.logger.error(
+                    f"[🚨 CRITICAL] {symbol} ExitManager 등록 실패 — "
+                    f"이 포지션은 자동 손절이 안 됩니다! 수동 감시 필요: {e}"
+                )
+                try:
+                    self.notifier.send_risk_alert(
+                        f"⚠️ {symbol} 매수됨 but 자동손절 등록 실패 — 수동 확인 필요"
+                    )
+                except Exception:
+                    pass
+
+            # ── 2단계: DB 메타데이터 저장 (실패해도 손절은 이미 보호됨) ──
             try:
                 import json as _json
-
-                # ★ 사전 분류 결과 재사용 (사용자 토글 반영됨)
-                pos_info = pos_info_pre or {
-                    "position_type": "스윙", "position_type_en": "swing",
-                    "holding_period": "1~4주", "atr_stop_multiplier": 2.0,
-                    "rr_ratio": 2.0, "classification_reason": "기본값"
-                }
                 reasons_list = []
                 if ensemble_signal:
                     reasons_list = ensemble_signal.reasons[:5]
 
-                # 유형별 목표가/손절가 계산
-                type_atr_mult = pos_info["atr_stop_multiplier"]
-                type_rr = pos_info["rr_ratio"]
-                stop_price = price - (atr * type_atr_mult)
-                target_price = price + (atr * type_atr_mult * type_rr)
+                stop_price = actual_price - (atr * type_atr_mult)
+                target_price = actual_price + (atr * type_atr_mult * type_rr)
 
                 self.logger.info(
-                    f"[포지션 유형] {symbol}: {pos_info['position_type']} "
-                    f"({pos_info['holding_period']}) | "
+                    f"[포지션 유형] {symbol}: {pos_info.get('position_type', '스윙')} "
+                    f"({pos_info.get('holding_period', '')}) | "
                     f"목표 {target_price:,.0f} / 손절 {stop_price:,.0f} | "
-                    f"분류근거: {pos_info['classification_reason']}"
+                    f"분류근거: {pos_info.get('classification_reason', '')}"
                 )
 
-                # DB에 포지션 메타데이터 저장
-                # [FIX] self.db를 사용 (별도 연결 생성 -> 기존 연결 재사용)
                 if self.db:
                     self.db.update_position(
                         symbol=symbol,
-                        quantity=pos_size.shares,
-                        avg_price=price,
-                        current_price=price,
-                        position_type=pos_info["position_type"],
-                        position_type_en=pos_info["position_type_en"],
+                        quantity=actual_qty,
+                        avg_price=actual_price,
+                        current_price=actual_price,
+                        position_type=pos_info.get("position_type", "스윙"),
+                        position_type_en=pos_info.get("position_type_en", "swing"),
                         target_price=round(target_price, 2),
                         stop_price=round(stop_price, 2),
                         reasons_json=_json.dumps(reasons_list, ensure_ascii=False),
-                        holding_period=pos_info["holding_period"],
+                        holding_period=pos_info.get("holding_period", ""),
                         bought_at=__import__("datetime").datetime.now().isoformat(),
                         mode=getattr(self.executor, "mode", "paper"),  # ★ Phase 5
                     )
-
-                # ── ExitManager에 진입 등록 (자동 청산용) ──
-                # 이후 매 분석 사이클에서 _check_exit_conditions()가
-                # 손절/익절/트레일링 스탑을 자동 체크합니다.
-                holding_days_max = {"단타": 5, "스윙": 30, "장기": 180}.get(
-                    pos_info["position_type"], 30
-                )
-                self.exit_manager.register_entry(
-                    symbol=symbol,
-                    entry_price=price,
-                    atr=atr,
-                    atr_stop_mult=type_atr_mult,
-                    rr_ratio=type_rr,
-                    holding_days_max=holding_days_max,
-                )
                 self._save_exit_state(symbol)  # DB 동기화
             except Exception as e:
                 self.logger.warning(
-                    f"[포지션 유형] {symbol}: 분류/저장 실패 (매수 자체는 성공): {e}"
+                    f"[포지션 메타 저장] {symbol}: DB 저장 실패 "
+                    f"(매수+손절등록은 성공, 다음 사이클에서 재동기화): {e}"
                 )
 
     def _execute_sell(self, symbol: str, exit_reason: str = "signal_sell"):
@@ -1904,9 +2226,12 @@ class QuantBot:
             self.logger.warning(f"[매도 거부] {symbol}: {reason}")
             return
 
-        # 모의매매기에 현재가 설정 (최신 가격으로 매도)
+        # 모의매매기에 현재가 설정 — 실시간 시세 우선 (모의 체결도 현실적으로)
         if hasattr(self.executor, 'set_current_price'):
-            self.executor.set_current_price(symbol, held.current_price)
+            _rt = self._get_realtime_price(symbol)
+            self.executor.set_current_price(
+                symbol, _rt if _rt else held.current_price
+            )
 
         # ── 청산 결정 상세 생성 ──
         # 거래 이력 모달에서 "왜 매도했는지" 클릭 시 보이는 내용
@@ -1945,9 +2270,36 @@ class QuantBot:
             symbol, strategy=exit_reason, decision_json=decision_json_str,
         )
         if order and order.status.value == "filled":
+            # ★ 체결가 안전 처리 — KIS phantom 방어
+            # KIS가 드물게 filled_price=0/None을 반환하면:
+            #  - None → quantity*None = TypeError → 청산 후처리 전부 누락
+            #  - 0    → raw_pnl=(0-avg)*qty = 가짜 큰 손실 → kill_switch 오발동
+            # 체결가 미수신 시 분석 시점 현재가 → 평균매수가 순으로 근사치 사용.
             price = order.filled_price
+            if not price or price <= 0:
+                fallback = float(held.current_price) if held.current_price and held.current_price > 0 \
+                           else float(held.avg_price)
+                self.logger.warning(
+                    f"[매도] {symbol} 체결가 미수신(={order.filled_price}) → "
+                    f"근사가 ₩{fallback:,.0f} 사용. 실현 PnL은 근사치 — "
+                    f"정확한 금액은 KIS 거래내역에서 확인하세요."
+                )
+                price = fallback
+            # ★ Phase 12 FIX: 실제 체결 수량 사용 (KIS 부분 체결 대응)
+            # _execute_buy와 동일 — order.filled_quantity가 0이면(paper 등) 보유수량 fallback.
+            # 부분 체결 시 held.quantity(주문량)로 기록하면 실현 PnL·알림·ExitManager가 어긋남.
+            actual_qty = (order.filled_quantity
+                          if order.filled_quantity and order.filled_quantity > 0
+                          else held.quantity)
+            fully_closed = actual_qty >= held.quantity
+            if not fully_closed:
+                self.logger.warning(
+                    f"[부분 체결] {symbol}: 전량청산 주문 {held.quantity}주 중 "
+                    f"{actual_qty}주만 체결 — 잔여 {held.quantity - actual_qty}주는 "
+                    f"ExitManager 유지(손절 보호 지속)"
+                )
             # 알림 금액은 KRW 기준 (USD 종목이면 환산)
-            total_krw = to_krw(symbol, held.quantity * price)
+            total_krw = to_krw(symbol, actual_qty * price)
             # ★ CRITICAL: 실현 PnL 계산 → SafetyGuard에 전달 (없으면 daily_pnl이 영원히 0이 됨)
             # PaperExecutor는 order에 realized_pnl을 attach하지 않지만 trade_history 최근 항목에 있음
             realized_pnl = 0.0
@@ -1957,34 +2309,42 @@ class QuantBot:
                     if last_trade.get("symbol") == symbol and last_trade.get("side", "").lower() == "sell":
                         realized_pnl = float(last_trade.get("realized_pnl", 0) or 0)
                 # KIS executor는 trade_history가 없으므로 PnL을 직접 계산
+                # price는 위에서 유효성 보장됨 → 가짜 손실 발생 안 함
                 if realized_pnl == 0.0 and held.avg_price > 0:
-                    # 평균 매수가 vs 매도가 차이 × 수량 → KRW 환산
-                    raw_pnl = (price - held.avg_price) * held.quantity
+                    # 평균 매수가 vs 매도가 차이 × 실제 체결수량 → KRW 환산
+                    raw_pnl = (price - held.avg_price) * actual_qty
                     realized_pnl = to_krw(symbol, raw_pnl)
             except Exception as pnl_err:
                 self.logger.debug(f"[매도] PnL 계산 실패 ({pnl_err}) → 0 사용")
 
             self.logger.info(
-                f"[매도 체결] {symbol} {held.quantity}주 @ {price:,.2f} 전량 청산 "
+                f"[매도 체결] {symbol} {actual_qty}주 @ {price:,.2f} "
+                f"{'전량 청산' if fully_closed else '부분 체결'} "
                 f"({exit_reason}) | 실현PnL ₩{realized_pnl:,.0f}"
             )
-            self.notifier.send_trade_executed(symbol, "SELL", held.quantity, price, total_krw)
-            self.discord.send_trade_executed(symbol, "SELL", held.quantity, price, total_krw)
+            self.notifier.send_trade_executed(symbol, "SELL", actual_qty, price, total_krw)
+            self.discord.send_trade_executed(symbol, "SELL", actual_qty, price, total_krw)
             # DB 저장은 paper_executor._execute_order() 내부에서 이미 처리됨
             # ★ CRITICAL FIX: pnl도 전달해야 daily_pnl이 누적되고 kill_switch가 발동됨
             self.safety.record_trade(symbol, "SELL", pnl=realized_pnl, value=total_krw)
 
-            # ── ExitManager 상태 정리 (전량 청산이므로 등록 해제) ──
-            self.exit_manager.unregister(symbol)
+            # ── ExitManager 상태 정리 ──
+            if fully_closed:
+                # 전량 청산 → ExitManager 등록 해제
+                self.exit_manager.unregister(symbol)
 
-            # ── [v2.2] 매도 쿨다운 등록 (반복매매 방지) ──
-            # 매도 직후 같은 종목을 재매수하면 수수료만 먹는 무의미한 거래
-            # 일정 시간(기본 1시간) 동안 해당 종목 재매수를 차단
-            self._sell_cooldowns[symbol] = time.time()
-            self.logger.info(
-                f"[쿨다운] {symbol}: 매도 후 {self._cooldown_seconds // 60}분 "
-                f"재매수 쿨다운 시작"
-            )
+                # ── [v2.2] 매도 쿨다운 등록 (반복매매 방지) ──
+                # 매도 직후 같은 종목을 재매수하면 수수료만 먹는 무의미한 거래
+                # 일정 시간(기본 1시간) 동안 해당 종목 재매수를 차단
+                self._sell_cooldowns[symbol] = time.time()
+                self.logger.info(
+                    f"[쿨다운] {symbol}: 매도 후 {self._cooldown_seconds // 60}분 "
+                    f"재매수 쿨다운 시작"
+                )
+            else:
+                # 부분 체결 → 잔여 포지션은 ExitManager 유지(손절 보호 지속).
+                # 등록 해제·쿨다운 안 함 → 다음 사이클에서 잔여분 청산 재시도.
+                self._save_exit_state(symbol)
 
     def _execute_partial_sell(
         self, symbol: str, ratio: float, exit_reason: str = "take_profit_1",
@@ -2031,7 +2391,10 @@ class QuantBot:
             return
 
         if hasattr(self.executor, 'set_current_price'):
-            self.executor.set_current_price(symbol, held.current_price)
+            _rt = self._get_realtime_price(symbol)
+            self.executor.set_current_price(
+                symbol, _rt if _rt else held.current_price
+            )
 
         # ── 분할 매도 결정 상세 ──
         import json as _dj
@@ -2064,8 +2427,21 @@ class QuantBot:
             decision_json=partial_decision_str,
         )
         if order and order.status.value == "filled":
-            sold_qty = order.quantity
+            # ★ Phase 12 FIX: 실제 체결 수량 사용 (KIS 부분 체결 대응)
+            # order.filled_quantity가 0이면(paper 등) 주문 수량 fallback.
+            sold_qty = (order.filled_quantity
+                        if order.filled_quantity and order.filled_quantity > 0
+                        else order.quantity)
+            # ★ 체결가 안전 처리 — KIS phantom(filled_price=0/None) 방어
             price = order.filled_price
+            if not price or price <= 0:
+                fallback = float(held.current_price) if held.current_price and held.current_price > 0 \
+                           else float(held.avg_price)
+                self.logger.warning(
+                    f"[부분 매도] {symbol} 체결가 미수신(={order.filled_price}) → "
+                    f"근사가 ₩{fallback:,.0f} 사용 (실현 PnL 근사치)"
+                )
+                price = fallback
             total_krw = to_krw(symbol, sold_qty * price)
             # ★ CRITICAL: 실현 PnL 계산 (분할 매도분)
             realized_pnl = 0.0
@@ -2110,14 +2486,25 @@ class QuantBot:
             account = self.executor.get_account()
             positions = self.executor.get_positions()
 
-            # MDD 체크
+            # MDD 체크 (★ Phase 10: 현재 모드만)
             if self.db:
-                mdd = self.db.calculate_max_drawdown(days=30)
-                if mdd > 0.15:  # MDD 15% 초과
-                    msg = f"⚠️ MDD 경고: {mdd*100:.1f}% (한도: 15%)"
-                    self.logger.warning(msg)
-                    self.notifier.send_risk_alert(msg)
-                    self.discord.send_risk_alert(msg)
+                mdd = self.db.calculate_max_drawdown(
+                    days=30, mode=getattr(self.executor, "mode", "paper")
+                )
+                # ★ 최대 낙폭 한도 — 설정값(settings.risk.max_drawdown) 사용.
+                #   초과 시 신규 매수를 자동 중단(보유·손절·매도는 유지).
+                #   이전 버그: 하드코딩 0.15 + 경고만 (자동 중단 없음).
+                mdd_limit = getattr(self.settings.risk, "max_drawdown", 0.15)
+                if mdd > mdd_limit:
+                    if not getattr(self, "_risk_halt_new_buys", False):
+                        self._risk_halt_new_buys = True
+                        msg = (
+                            f"🚨 최대 낙폭 {mdd*100:.1f}% > 한도 {mdd_limit*100:.0f}% "
+                            f"→ 신규 매수 자동 중단 (보유·손절·매도는 유지)"
+                        )
+                        self.logger.critical(msg)
+                        self.notifier.send_risk_alert(msg)
+                        self.discord.send_risk_alert(msg)
 
             # 포지션별 손절 체크
             for pos in positions:

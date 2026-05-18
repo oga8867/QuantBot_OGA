@@ -436,6 +436,50 @@ class DatabaseManager:
             "total_sell_value": sum(t["total_value"] for t in sells),
         }
 
+    def get_kelly_stats(self, mode=None):
+        """
+        Kelly 사이징용 거래 통계 — 닫힌(매도 완료) 거래의 승률·평균손익률.
+
+        Returns:
+            dict: {win_rate, avg_win, avg_loss, sample_size}
+              - win_rate: 승률 (0~1)
+              - avg_win: 이긴 거래 평균 수익률 (양수, 예: 0.08 = +8%)
+              - avg_loss: 진 거래 평균 손실률 (양수, 예: 0.04 = -4%)
+              - sample_size: 손익이 확정된 닫힌 거래 수
+        """
+        with self._lock:
+            if mode:
+                rows = [dict(r) for r in self.conn.execute(
+                    "SELECT pnl, total_value FROM trades "
+                    "WHERE UPPER(side) = 'SELL' AND mode = ?", (mode,)).fetchall()]
+            else:
+                rows = [dict(r) for r in self.conn.execute(
+                    "SELECT pnl, total_value FROM trades "
+                    "WHERE UPPER(side) = 'SELL'").fetchall()]
+        wins, losses = [], []
+        for r in rows:
+            pnl = r.get("pnl") or 0
+            total = r.get("total_value") or 0
+            cost = total - pnl  # 매도금액 - 손익 ≈ 매수원가
+            if cost <= 0:
+                continue  # 비정상 데이터 스킵
+            ret = pnl / cost  # 1회 수익률
+            if pnl > 0:
+                wins.append(ret)
+            elif pnl < 0:
+                losses.append(-ret)  # 손실은 양수로 변환
+            # pnl == 0 (본전)은 승/패 아님 → 통계에서 제외
+        sample = len(wins) + len(losses)
+        if sample == 0:
+            return {"win_rate": 0.0, "avg_win": 0.0,
+                    "avg_loss": 0.0, "sample_size": 0}
+        return {
+            "win_rate": len(wins) / sample,
+            "avg_win": (sum(wins) / len(wins)) if wins else 0.0,
+            "avg_loss": (sum(losses) / len(losses)) if losses else 0.0,
+            "sample_size": sample,
+        }
+
     # === 포지션 관리 ===
 
     def save_positions(self, positions, mode="paper"):
@@ -525,6 +569,32 @@ class DatabaseManager:
                      mode))
             self.conn.commit()
 
+    def update_exit_state(self, symbol, mode="paper", *,
+                          entry_atr=0.0, current_stop=0.0,
+                          highest_since_entry=0.0, partial_sold_pct=0.0,
+                          target_1=0.0, target_2=0.0):
+        """
+        ExitManager 추적 필드만 갱신 (손절/익절/트레일링 상태 동기화)
+
+        ⚠️ 반드시 (symbol, mode) 둘 다로 필터 — positions는 UNIQUE(symbol, mode).
+        mode 누락 시 다른 모드의 같은 종목 행을 잘못 덮어쓸 수 있음.
+
+        쓰레드 락(self._lock)으로 보호되어 다른 DB writer와 직렬화됩니다.
+        해당 (symbol, mode) 행이 없으면 아무것도 안 함 (조용히 무시).
+        """
+        with self._lock:
+            self.conn.execute(
+                """UPDATE positions SET
+                    entry_atr = ?, current_stop = ?, highest_since_entry = ?,
+                    partial_sold_pct = ?, target_1 = ?, target_2 = ?,
+                    stop_price = ?
+                WHERE symbol = ? AND mode = ?""",
+                (float(entry_atr), float(current_stop), float(highest_since_entry),
+                 float(partial_sold_pct), float(target_1), float(target_2),
+                 float(current_stop),  # stop_price도 current_stop으로 동기화
+                 symbol, mode))
+            self.conn.commit()
+
     def load_positions(self, mode=None):
         """
         DB에서 포지션 복원
@@ -606,18 +676,28 @@ class DatabaseManager:
                      daily_return, cumulative_return, max_drawdown, mode))
             self.conn.commit()
 
-    def get_snapshots(self, days=30):
-        """최근 N일간 스냅샷"""
+    def get_snapshots(self, days=30, mode=None):
+        """최근 N일간 스냅샷 (★ Phase 10: mode 필터)"""
         with self._lock:
+            if mode:
+                return [dict(r) for r in self.conn.execute(
+                    "SELECT * FROM portfolio_snapshots WHERE mode = ? "
+                    "ORDER BY date DESC LIMIT ?", (mode, days)
+                ).fetchall()]
             return [dict(r) for r in self.conn.execute(
                 "SELECT * FROM portfolio_snapshots ORDER BY date DESC LIMIT ?", (days,)
             ).fetchall()]
 
-    def get_latest_snapshot(self):
-        """최신 스냅샷"""
+    def get_latest_snapshot(self, mode=None):
+        """최신 스냅샷 (★ Phase 10: mode 필터)"""
         with self._lock:
-            row = self.conn.execute(
-                "SELECT * FROM portfolio_snapshots ORDER BY date DESC LIMIT 1").fetchone()
+            if mode:
+                row = self.conn.execute(
+                    "SELECT * FROM portfolio_snapshots WHERE mode = ? "
+                    "ORDER BY date DESC LIMIT 1", (mode,)).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT * FROM portfolio_snapshots ORDER BY date DESC LIMIT 1").fetchone()
             return dict(row) if row else None
 
     # === Equity History (시간별 자산 추적) ===
@@ -663,9 +743,9 @@ class DatabaseManager:
                     "SELECT * FROM equity_history ORDER BY timestamp DESC LIMIT 1").fetchone()
             return dict(row) if row else None
 
-    def calculate_max_drawdown(self, days=30):
-        """최대 낙폭(MDD) 계산 (0~1)"""
-        history = self.get_equity_history(days=days)
+    def calculate_max_drawdown(self, days=30, mode=None):
+        """최대 낙폭(MDD) 계산 (0~1) — ★ Phase 10: mode 필터로 paper/live 분리"""
+        history = self.get_equity_history(days=days, mode=mode)
         if not history:
             return 0.0
         equities = [h["total_equity"] for h in history]
@@ -714,9 +794,16 @@ class DatabaseManager:
 
     # === 데이터 초기화 ===
 
-    def reset_all_data(self):
+    def reset_all_data(self, mode=None):
         """
-        모든 거래/포지션/자산 데이터를 초기화합니다.
+        거래/포지션/자산 데이터를 초기화합니다.
+
+        Parameters:
+            mode: "paper" → 모의거래 데이터만 삭제
+                  "live"  → 실거래 데이터만 삭제
+                  None    → 전체 삭제 (하위 호환)
+            ⚠️ 모드를 지정하면 해당 모드 행만 지웁니다. 모의거래 초기화로
+               실거래 이력까지 날려버리는 사고를 막기 위함입니다.
 
         삭제 대상:
         - positions: 보유 포지션
@@ -734,25 +821,38 @@ class DatabaseManager:
         deleted = {}
         tables = ["positions", "trades", "equity_history",
                   "portfolio_snapshots", "signals"]
+        mode_scoped = mode in ("paper", "live")
 
         with self._lock:
             for table in tables:
                 try:
-                    cursor = self.conn.execute(f"SELECT COUNT(*) FROM {table}")
-                    count = cursor.fetchone()[0]
-                    self.conn.execute(f"DELETE FROM {table}")
+                    if mode_scoped:
+                        cursor = self.conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE mode = ?",
+                            (mode,))
+                        count = cursor.fetchone()[0]
+                        self.conn.execute(
+                            f"DELETE FROM {table} WHERE mode = ?", (mode,))
+                    else:
+                        cursor = self.conn.execute(
+                            f"SELECT COUNT(*) FROM {table}")
+                        count = cursor.fetchone()[0]
+                        self.conn.execute(f"DELETE FROM {table}")
                     deleted[table] = count
                 except Exception:
                     deleted[table] = 0
 
-            # AUTO_INCREMENT 카운터 리셋
-            try:
-                self.conn.execute(
-                    "DELETE FROM sqlite_sequence WHERE name IN (?, ?, ?, ?, ?)",
-                    tables
-                )
-            except Exception:
-                pass
+            # AUTO_INCREMENT 카운터 리셋 — 전체 삭제 시에만.
+            # 모드별 삭제는 다른 모드 행이 남아 있으므로 sqlite_sequence를
+            # 건드리지 않습니다 (건드리면 ID 재사용 충돌 위험).
+            if not mode_scoped:
+                try:
+                    self.conn.execute(
+                        "DELETE FROM sqlite_sequence WHERE name IN (?, ?, ?, ?, ?)",
+                        tables
+                    )
+                except Exception:
+                    pass
 
             self.conn.commit()
         return deleted

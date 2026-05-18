@@ -592,9 +592,10 @@ class PaperExecutor(BaseExecutor):
             return
 
         # 1. 기존 DB 메타데이터 읽기 (DELETE 전에!)
+        # ★ mode 필터 — 자기 모드의 메타데이터만 (paper/live 메타 섞임 방지)
         existing_meta = {}
         try:
-            db_positions = self.db.load_positions()
+            db_positions = self.db.load_positions(mode=self.mode)
             for db_pos in db_positions:
                 sym = db_pos.get("symbol", "")
                 if sym:

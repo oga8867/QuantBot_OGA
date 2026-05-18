@@ -59,19 +59,23 @@ class WeeklyReportGenerator:
         os.makedirs(report_dir, exist_ok=True)
 
     def generate(self, period: str = "weekly",
-                 capital: float = 100000) -> Optional[str]:
+                 capital: float = 100000, mode: str = "paper") -> Optional[str]:
         """
         보고서 생성 (메인 진입점)
 
         Args:
             period: "weekly" (7일) 또는 "monthly" (30일)
             capital: 초기 자본금 (수익률 계산용)
+            mode: 'paper'(모의투자) 또는 'live'(실거래)
+                  ★ 모드별로 거래/자산/신호를 분리하여 보고서 생성.
+                  모의투자와 실거래 실적이 한 보고서에 섞이지 않도록 함.
 
         Returns:
             생성된 HTML 파일 경로, 실패 시 None
         """
         days = 7 if period == "weekly" else 30
         label = "주간" if period == "weekly" else "월간"
+        mode_label = "실거래" if mode == "live" else "모의투자"
 
         try:
             # DB에서 데이터 수집
@@ -80,17 +84,17 @@ class WeeklyReportGenerator:
                 self.db = DatabaseManager()
                 self.db.initialize()
 
-            # ── 1. Equity 데이터 ──
-            equity_data = self.db.get_equity_history(days=days)
+            # ── 1. Equity 데이터 (★ 모드 필터) ──
+            equity_data = self.db.get_equity_history(days=days, mode=mode)
 
-            # ── 2. 거래 데이터 ──
-            trades = self.db.get_trades(limit=10000)
+            # ── 2. 거래 데이터 (★ 모드 필터) ──
+            trades = self.db.get_trades(limit=10000, mode=mode)
             # 기간 내 거래만 필터
             since = (datetime.now() - timedelta(days=days)).isoformat()
             period_trades = [t for t in trades if t.get("timestamp", "") >= since]
 
-            # ── 3. 신호 데이터 ──
-            signals = self.db.get_signals(limit=1000)
+            # ── 3. 신호 데이터 (★ 모드 필터) ──
+            signals = self.db.get_signals(limit=1000, mode=mode)
             period_signals = [s for s in signals if s.get("timestamp", "") >= since]
 
             # ── 4. 성과 계산 ──
@@ -101,20 +105,20 @@ class WeeklyReportGenerator:
 
             # ── 6. HTML 생성 ──
             html = self._build_html(
-                label=label, days=days, perf=perf,
+                label=f"{label} ({mode_label})", days=days, perf=perf,
                 trades=period_trades, signals=period_signals,
                 symbol_stats=symbol_stats, equity_data=equity_data
             )
 
-            # ── 7. 파일 저장 ──
+            # ── 7. 파일 저장 (모드별 파일명 분리) ──
             date_str = datetime.now().strftime("%Y%m%d")
-            filename = f"{period}_report_{date_str}.html"
+            filename = f"{period}_report_{mode}_{date_str}.html"
             filepath = os.path.join(self.report_dir, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(html)
 
-            logger.info(f"[{label} 보고서] 생성 완료: {filepath}")
+            logger.info(f"[{label} 보고서 - {mode_label}] 생성 완료: {filepath}")
             return filepath
 
         except Exception as e:

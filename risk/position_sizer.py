@@ -139,7 +139,7 @@ class PositionSizer:
         atr_krw = atr * fx_rate
 
         # 방법별 계산 (KRW 환산 가격으로 계산 → shares는 통화 무관)
-        if method == "kelly" and win_rate > 0 and avg_loss > 0:
+        if method == "kelly" and win_rate > 0 and avg_loss > 0 and avg_win > 0:
             result = self._kelly_sizing(price_krw, win_rate, avg_win, avg_loss)
         elif method == "atr" and atr > 0:
             result = self._atr_sizing(price_krw, atr_krw)
@@ -269,7 +269,9 @@ class PositionSizer:
             avg_win: 평균 수익률 (양수)
             avg_loss: 평균 손실률 (양수)
         """
-        if avg_loss == 0 or win_rate <= 0:
+        # ★ avg_win<=0 가드 — b=avg_win/avg_loss가 0이 되면 kelly=.../b 에서
+        #   ZeroDivisionError. avg_loss<=0도 함께 차단.
+        if avg_loss <= 0 or win_rate <= 0 or avg_win <= 0:
             return PositionSize(reason="Kelly 계산 불가 (데이터 부족)")
 
         # 손익비 (odds)

@@ -242,7 +242,13 @@ class TestExitManager:
         assert decision.sell_ratio == 1.0
 
     def test_take_profit_1_triggers_partial_sell(self):
-        """1차 목표 도달 시 50% 분할 매도 + 본전 상향"""
+        """
+        1차 목표 도달 시 50% 분할 매도 + 본전 상향
+
+        ⚠️ Phase 6C 수정 후: evaluate()는 더 이상 state를 사전 변경하지 않음
+        매도 성공 확정 후 commit_exit()을 호출해야 state가 갱신됨.
+        (이전 버그: 매도 실패 시 상태만 변경되어 보호 무력화)
+        """
         from executor.exit_manager import ExitReason
         state = self.em.register_entry("AAPL", entry_price=100.0, atr=2.0)
         # 목표1 108 도달
@@ -250,17 +256,42 @@ class TestExitManager:
         assert decision.should_exit
         assert decision.reason == ExitReason.TAKE_PROFIT_1
         assert decision.sell_ratio == 0.5
-        # 손절선이 본전(100)으로 상향
-        assert state.current_stop == 100.0
+        # evaluate()만 호출한 시점: state는 아직 변경 안 됨 (매도 성공 확정 전)
+        assert state.partial_sold_pct == 0.0
+        # decision에는 새 손절선이 들어있음 (commit 시 적용 예정)
+        assert decision.new_stop_price == 100.0
+
+        # 매도 성공 시뮬레이션 → commit_exit으로 state 갱신
+        self.em.commit_exit("AAPL", decision)
+        assert state.current_stop == 100.0  # 본전 상향 적용됨
         assert state.partial_sold_pct == 0.5
 
+    def test_take_profit_1_state_unchanged_without_commit(self):
+        """
+        Phase 6C 회귀 방지: evaluate() 호출만으로는 state가 변경되면 안 됨
+        매도 실패 시 보호 유지를 위해 commit_exit() 호출이 필수
+        """
+        state = self.em.register_entry("AAPL", entry_price=100.0, atr=2.0)
+        initial_stop = state.current_stop
+        # 목표1 도달 → decision은 should_exit=True지만 state 그대로
+        self.em.evaluate("AAPL", current_price=109.0)
+        assert state.partial_sold_pct == 0.0
+        assert state.current_stop == initial_stop  # 변경 없음 (96.0)
+
     def test_trailing_stop_after_partial_exit(self):
-        """1차 익절 후 가격 하락 시 트레일링 스탑 발동"""
+        """
+        1차 익절 후 가격 하락 시 트레일링 스탑 발동
+
+        Phase 6C 수정 후: evaluate() 뒤 commit_exit() 호출해야
+        partial_sold_pct가 변경되어 트레일링 스탑 로직이 활성화됨.
+        """
         from executor.exit_manager import ExitReason
         state = self.em.register_entry("AAPL", entry_price=100.0, atr=2.0)
-        # 1차 익절
-        self.em.evaluate("AAPL", current_price=109.0)
-        # 가격 더 상승 (최고가 갱신)
+        # 1차 익절 평가 + commit (매도 성공 시뮬레이션)
+        dec1 = self.em.evaluate("AAPL", current_price=109.0)
+        self.em.commit_exit("AAPL", dec1)
+        assert state.partial_sold_pct == 0.5
+        # 가격 더 상승 (최고가 갱신, 트레일링 스탑 동작 시작)
         self.em.evaluate("AAPL", current_price=120.0)  # highest=120, trailing=120-2*3=114
         # 트레일링 스탑까지 하락
         decision = self.em.evaluate("AAPL", current_price=113.0)

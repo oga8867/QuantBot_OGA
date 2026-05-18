@@ -68,6 +68,8 @@ class Order:
     filled_at: Optional[datetime] = None
     strategy: str = ""                  # 어떤 전략이 주문했는지
     decision_json: str = "{}"           # 매매 결정 상세 JSON (앙상블 점수, 모듈 기여도 등)
+    avg_price_hint: float = 0.0         # 매도 시 평균매수가 힌트 (실현PnL 정확 계산용)
+                                        # caller가 보유 정보로 채워 전달 (executor가 API 재조회 안 하도록)
 
 
 @dataclass
@@ -197,8 +199,16 @@ class BaseExecutor(ABC):
         return self.submit_order(order)
 
     def sell_market(self, symbol: str, quantity: int, strategy: str = "",
-                    decision_json: str = "{}") -> Order:
-        """시장가 매도 (편의 메서드)"""
+                    decision_json: str = "{}", avg_price_hint: float = 0.0) -> Order:
+        """
+        시장가 매도 (편의 메서드)
+
+        avg_price_hint: 매도 직전 평균매수가 (KIS executor가 실현PnL 정확 계산용 사용).
+                        caller가 self.get_positions()로 미리 조회한 값을 전달.
+                        executor 내부에서 추가 API 호출을 방지하기 위함
+                        (KIS의 get_positions() 호출 시 _last_positions_call_ok 플래그
+                         오염 → 후속 매수 신호 silent 차단되는 버그 회피).
+        """
         order = Order(
             symbol=symbol,
             side=OrderSide.SELL,
@@ -206,6 +216,7 @@ class BaseExecutor(ABC):
             quantity=quantity,
             strategy=strategy,
             decision_json=decision_json,
+            avg_price_hint=avg_price_hint,
         )
         return self.submit_order(order)
 
@@ -267,7 +278,7 @@ class BaseExecutor(ABC):
 
     def close_position(self, symbol: str, strategy: str = "close_position",
                        decision_json: str = "{}") -> Optional[Order]:
-        """특정 종목 전량 청산"""
+        """특정 종목 전량 청산 (avg_price를 sell_market에 힌트로 전달)"""
         positions = self.get_positions()
         for pos in positions:
             if pos.symbol == symbol and pos.quantity > 0:
@@ -275,6 +286,7 @@ class BaseExecutor(ABC):
                     symbol, pos.quantity,
                     strategy=strategy,
                     decision_json=decision_json,
+                    avg_price_hint=float(pos.avg_price),
                 )
         return None
 
@@ -315,5 +327,6 @@ class BaseExecutor(ABC):
                     symbol, sell_qty,
                     strategy=strategy,
                     decision_json=decision_json,
+                    avg_price_hint=float(pos.avg_price),
                 )
         return None

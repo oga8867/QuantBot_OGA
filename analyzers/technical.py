@@ -162,8 +162,10 @@ class TechnicalAnalyzer:
         gain = delta.where(delta > 0, 0)  # 상승한 날만 (나머지 0)
         loss = (-delta.where(delta < 0, 0))  # 하락한 날만 (양수로 변환)
 
-        # Wilder's Smoothing Method (EMA와 유사하지만 약간 다름)
-        # 처음 N일은 단순평균, 이후는 지수이동평균 방식
+        # 평균 상승폭/하락폭 — 단순이동평균(SMA, rolling().mean())
+        # ※ 원조 RSI(Wilder)는 Wilder 평활(EMA류, α=1/N)을 쓰지만 이 구현은
+        #   단순이동평균을 사용한다. 두 방식은 값이 달라 표준 RSI 대비
+        #   과매수·과매도(70/30) 도달 시점이 약간 다를 수 있음.
         avg_gain = gain.rolling(window=period).mean()
         avg_loss = loss.rolling(window=period).mean()
 
@@ -285,7 +287,7 @@ class TechnicalAnalyzer:
             |저가 - 전일종가|       ← 갭 하락 반영
         )
 
-        ATR = True Range의 N일 이동평균
+        ATR = True Range의 N일 단순이동평균(SMA)
 
         활용:
         - 손절선 설정: 현재가 - 2×ATR (평균 변동의 2배 밖에서 손절)
@@ -317,7 +319,10 @@ class TechnicalAnalyzer:
         # 세 값 중 최대값이 True Range
         true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-        # ATR = True Range의 이동평균
+        # ATR = True Range의 단순이동평균(SMA)
+        # ※ 원조 ATR(Wilder)은 Wilder 평활(EMA류)을 쓰지만 이 구현은
+        #   단순이동평균을 사용한다. 손절폭·트레일링·사이징이 표준 ATR과
+        #   미세하게 다를 수 있음.
         atr = true_range.rolling(window=period).mean()
 
         return atr
@@ -399,7 +404,10 @@ class TechnicalAnalyzer:
         result["BB_Middle"] = middle
         result["BB_Lower"] = lower
         # %B: 밴드 내 위치 (0=하단, 1=상단)
-        result["BB_PctB"] = (close - lower) / (upper - lower)
+        # ★ 0-나누기 가드: 가격이 완전히 평평하면(거래정지 등) upper==lower → 분모 0
+        #   → inf/nan이 신호·스캐너로 전파됨. 분모 0이면 0.5(중립)로 처리.
+        bb_width = (upper - lower)
+        result["BB_PctB"] = ((close - lower) / bb_width).where(bb_width != 0, 0.5)
 
         # ATR
         result["ATR"] = self.atr(result)
@@ -408,8 +416,13 @@ class TechnicalAnalyzer:
         result["OBV"] = self.obv(result)
 
         # 거래량 비율 (20일 평균 대비)
+        # ★ 0-나누기 가드: 20일 평균 거래량이 0이면(신규상장/거래정지) → inf
+        #   → 스캐너가 '거래량 극단 급증'으로 오인. 분모 0이면 1.0(중립)로 처리.
+        _vol_avg20 = result["Volume"].rolling(20).mean()
         result["Volume_Ratio"] = (
-            result["Volume"] / result["Volume"].rolling(20).mean()
+            (result["Volume"] / _vol_avg20).where(
+                (_vol_avg20 != 0) & (_vol_avg20.notna()), 1.0
+            )
         )
 
         return result

@@ -43,6 +43,8 @@ const i18n = {
     btn_start: { ko: "봇 시작", en: "Start Bot" },
     btn_stop: { ko: "봇 중지", en: "Stop Bot" },
     btn_reset: { ko: "초기화", en: "Reset" },
+    btn_reset_paper: { ko: "모의 초기화", en: "Reset Paper" },
+    btn_reset_live: { ko: "실거래 초기화", en: "Reset Live" },
     btn_refresh: { ko: "새로고침", en: "Refresh" },
     btn_save: { ko: "설정 저장", en: "Save Settings" },
     btn_add: { ko: "추가", en: "Add" },
@@ -493,7 +495,8 @@ function updateStatusUI(status) {
 
     const btnStart = document.getElementById("btnStart");
     const btnStop = document.getElementById("btnStop");
-    const btnReset = document.getElementById("btnReset");
+    const btnResetPaper = document.getElementById("btnResetPaper");
+    const btnResetLive = document.getElementById("btnResetLive");
 
     if (status.running) {
         dot.className = status.live ? "status-dot live" : "status-dot active";
@@ -504,7 +507,9 @@ function updateStatusUI(status) {
         // ★ 버튼 텍스트도 "시작 중..." → "봇 시작됨"으로 갱신
         btnStart.textContent = currentLang === "ko" ? "봇 시작됨" : "Bot Running";
         btnStop.disabled = false;
-        btnReset.disabled = true;
+        // 봇 실행 중에는 초기화 금지 (모의/실거래 둘 다)
+        if (btnResetPaper) btnResetPaper.disabled = true;
+        if (btnResetLive) btnResetLive.disabled = true;
     } else {
         dot.className = "status-dot";
         text.textContent = currentLang === "ko" ? "중지됨" : "Stopped";
@@ -512,7 +517,8 @@ function updateStatusUI(status) {
         // ★ 중지 시 버튼 텍스트 원복
         btnStart.textContent = currentLang === "ko" ? "봇 시작" : "Start Bot";
         btnStop.disabled = true;
-        btnReset.disabled = false;
+        if (btnResetPaper) btnResetPaper.disabled = false;
+        if (btnResetLive) btnResetLive.disabled = false;
     }
 
     if (status.live) {
@@ -793,10 +799,13 @@ function updateSettingsUI(settings) {
     document.getElementById("settingSizing").value = settings.sizing_method || "kelly";
     document.getElementById("settingRiskPerTrade").value = (settings.risk_per_trade || 0.02) * 100;
     document.getElementById("settingMaxPosition").value = (settings.max_position_size || 0.10) * 100;
+    document.getElementById("settingMaxOrderValue").value = settings.max_order_value || 0;
     document.getElementById("settingMaxDrawdown").value = (settings.max_drawdown || 0.15) * 100;
     document.getElementById("settingStopLoss").value = settings.stop_loss_atr_multiplier || 2.0;
     document.getElementById("settingRR").value = settings.risk_reward_ratio || 2.0;
     document.getElementById("settingKelly").value = settings.kelly_fraction || 0.5;
+    const kmtEl = document.getElementById("settingKellyMinTrades");
+    if (kmtEl) kmtEl.value = settings.kelly_min_trades || 20;
     document.getElementById("settingMaxDailyLoss").value = (settings.max_daily_loss || 0.03) * 100;
     document.getElementById("settingTelegramToken").value = settings.telegram_token || "";
     document.getElementById("settingTelegramChat").value = settings.telegram_chat_id || "";
@@ -810,6 +819,8 @@ function updateSettingsUI(settings) {
     if (dcBotTokenEl) dcBotTokenEl.value = settings.discord_bot_token || "";
     const dcBotChannelEl = document.getElementById("settingDiscordBotChannel");
     if (dcBotChannelEl) dcBotChannelEl.value = settings.discord_bot_channel_id || "";
+    const dcBotAppIdEl = document.getElementById("settingDiscordBotAppId");
+    if (dcBotAppIdEl) dcBotAppIdEl.value = settings.discord_bot_app_id || "";
     const dcBotAutoEl = document.getElementById("settingDiscordBotAutostart");
     if (dcBotAutoEl) dcBotAutoEl.checked = settings.discord_bot_autostart || false;
     // 봇 연결 상태 갱신
@@ -874,15 +885,6 @@ function updateSettingsUI(settings) {
     }
 
     // 한국/미국 시장 거래 시간 범위
-    const krStartEl = document.getElementById("settingKrStart");
-    const krEndEl = document.getElementById("settingKrEnd");
-    const usStartEl = document.getElementById("settingUsStart");
-    const usEndEl = document.getElementById("settingUsEnd");
-    if (krStartEl) krStartEl.value = settings.schedule_kr_start || "09:00";
-    if (krEndEl) krEndEl.value = settings.schedule_kr_end || "15:30";
-    if (usStartEl) usStartEl.value = settings.schedule_us_start || "23:30";
-    if (usEndEl) usEndEl.value = settings.schedule_us_end || "06:00";
-
     // ── 브로커 API 키 반영 ──
     const kisKeyEl = document.getElementById("settingKisAppKey");
     if (kisKeyEl) kisKeyEl.value = settings.kis_app_key || "";
@@ -1055,31 +1057,48 @@ function updateDiscoveryBar(discovery) {
     stocksEl.textContent = allStocks.length > 0 ? allStocks.join("  ") : "";
 }
 
-async function resetBot() {
+async function resetBot(mode) {
+    // mode: 'paper' (모의거래 데이터) 또는 'live' (실거래 데이터)
+    //  → 지정한 모드 데이터만 삭제하고 다른 모드 데이터는 보존
+    if (mode !== "paper" && mode !== "live") {
+        showToast(currentLang === "ko" ? "초기화 모드 오류" : "Invalid reset mode", "error");
+        return;
+    }
+    const modeKr = mode === "live" ? "실거래" : "모의거래";
+    const modeEn = mode === "live" ? "LIVE" : "paper";
+
     // ── 2단계 확인: 실수로 누르는 것을 방지 ──
     const msg1 = currentLang === "ko"
-        ? "⚠️ 모든 포지션, 거래 이력, 자산 기록이 삭제됩니다.\n정말 초기화하시겠습니까?"
-        : "⚠️ All positions, trades, and equity history will be deleted.\nAre you sure?";
+        ? `⚠️ [${modeKr}] 데이터를 초기화합니다.\n${modeKr}의 모든 포지션·거래 이력·자산 기록이 삭제됩니다.\n(다른 모드 데이터는 보존됩니다)\n정말 초기화하시겠습니까?`
+        : `⚠️ Reset [${modeEn}] data.\nAll ${modeEn} positions, trades, and equity history will be deleted.\n(The other mode's data is preserved)\nAre you sure?`;
     if (!confirm(msg1)) return;
 
     const msg2 = currentLang === "ko"
-        ? "⚠️ 최종 확인: 이 작업은 되돌릴 수 없습니다.\n'확인'을 누르면 즉시 초기화됩니다."
-        : "⚠️ Final confirmation: This cannot be undone.\nClick OK to proceed.";
+        ? `⚠️ 최종 확인: [${modeKr}] 데이터 초기화는 되돌릴 수 없습니다.\n'확인'을 누르면 즉시 초기화됩니다.`
+        : `⚠️ Final confirmation: Resetting [${modeEn}] data cannot be undone.\nClick OK to proceed.`;
     if (!confirm(msg2)) return;
 
+    const btnId = mode === "live" ? "btnResetLive" : "btnResetPaper";
+    const btn = document.getElementById(btnId);
+    const origText = btn ? btn.textContent : "";
     try {
-        const btn = document.getElementById("btnReset");
-        btn.disabled = true;
-        btn.textContent = currentLang === "ko" ? "초기화 중..." : "Resetting...";
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = currentLang === "ko" ? "초기화 중..." : "Resetting...";
+        }
 
-        const res = await fetch("/api/bot/reset", { method: "POST" });
+        const res = await fetch("/api/bot/reset", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mode: mode }),
+        });
         const data = await res.json();
 
         if (data.success) {
             showToast(
                 currentLang === "ko"
                     ? `✅ ${data.message}`
-                    : `✅ Reset complete`,
+                    : `✅ ${modeEn} data reset complete`,
                 "success"
             );
             // 화면 데이터 갱신
@@ -1093,9 +1112,10 @@ async function resetBot() {
     } catch (e) {
         showToast(currentLang === "ko" ? "연결 오류" : "Connection error", "error");
     } finally {
-        const btn = document.getElementById("btnReset");
-        btn.disabled = false;
-        btn.textContent = currentLang === "ko" ? "초기화" : "Reset";
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = origText;
+        }
     }
 }
 
@@ -1108,11 +1128,14 @@ async function saveSettings() {
         sizing_method: document.getElementById("settingSizing").value,
         risk_per_trade: parseFloat(document.getElementById("settingRiskPerTrade").value) / 100,
         max_position_size: parseFloat(document.getElementById("settingMaxPosition").value) / 100,
+        max_order_value: parseFloat(document.getElementById("settingMaxOrderValue").value) || 0,
         max_drawdown: parseFloat(document.getElementById("settingMaxDrawdown").value) / 100,
         max_daily_loss: parseFloat(document.getElementById("settingMaxDailyLoss").value) / 100,
         stop_loss_atr_multiplier: parseFloat(document.getElementById("settingStopLoss").value),
         risk_reward_ratio: parseFloat(document.getElementById("settingRR").value),
         kelly_fraction: parseFloat(document.getElementById("settingKelly").value),
+        kelly_min_trades: document.getElementById("settingKellyMinTrades") ?
+            (parseInt(document.getElementById("settingKellyMinTrades").value, 10) || 20) : 20,
         telegram_token: document.getElementById("settingTelegramToken").value,
         telegram_chat_id: document.getElementById("settingTelegramChat").value,
         discord_webhook_url: document.getElementById("settingDiscordWebhook") ?
@@ -1121,6 +1144,8 @@ async function saveSettings() {
             document.getElementById("settingDiscordBotToken").value : "",
         discord_bot_channel_id: document.getElementById("settingDiscordBotChannel") ?
             document.getElementById("settingDiscordBotChannel").value : "",
+        discord_bot_app_id: document.getElementById("settingDiscordBotAppId") ?
+            document.getElementById("settingDiscordBotAppId").value : "",
         discord_bot_autostart: document.getElementById("settingDiscordBotAutostart") ?
             document.getElementById("settingDiscordBotAutostart").checked : false,
         dart_api_key: document.getElementById("settingDartApiKey") ?
@@ -1178,18 +1203,9 @@ async function saveSettings() {
 
         // ── 거래 스케줄 설정 ──
         // 분석 주기: 봇이 시장을 체크하는 간격
+        // (시장 시간은 코드 고정 — KR 09:00~15:30, US DST 자동)
         analysis_interval: document.getElementById("settingInterval") ?
             document.getElementById("settingInterval").value : "1h",
-        // 한국 시장 거래 시간 (KST)
-        schedule_kr_start: document.getElementById("settingKrStart") ?
-            document.getElementById("settingKrStart").value : "09:00",
-        schedule_kr_end: document.getElementById("settingKrEnd") ?
-            document.getElementById("settingKrEnd").value : "15:30",
-        // 미국 시장 거래 시간 (KST 기준)
-        schedule_us_start: document.getElementById("settingUsStart") ?
-            document.getElementById("settingUsStart").value : "23:30",
-        schedule_us_end: document.getElementById("settingUsEnd") ?
-            document.getElementById("settingUsEnd").value : "06:00",
     };
 
     try {
@@ -1469,10 +1485,16 @@ function _exitReasonKr(reason) {
 async function loadTrades() {
     try {
         const res = await fetch("/api/trades?limit=200");
-        const trades = await res.json();
+        const data = await res.json();
         const tbody = document.getElementById("tradesTable");
 
-        if (!trades || trades.length === 0) {
+        // ★ 에러 응답은 배열이 아닌 객체({"error":..,"trades":[]})
+        // 배열이 아니면 빈 배열로 처리 → applyTradeFilters의 .filter() TypeError 방지
+        const trades = Array.isArray(data)
+            ? data
+            : (data && Array.isArray(data.trades) ? data.trades : []);
+
+        if (!res.ok || trades.length === 0) {
             tbody.innerHTML = `<tr><td colspan="8" class="text-mute" style="text-align:center; padding:48px;">${i18n.empty_trades[currentLang]}</td></tr>`;
             window._tradesCache = [];
             updateTradeFilterStatus(0, 0);
@@ -2465,29 +2487,77 @@ function _buildScannerGrid(items) {
         const hasRealName = rawName !== item.symbol && rawName !== cleanSymbol;
         const displayName = hasRealName ? rawName : cleanSymbol;
         const displayCode = hasRealName ? cleanSymbol : "";
+        const safeName = (rawName).replace(/'/g, "\\'");
+
+        // ── 신호 판단 근거 (스캐너 전략 = 기술적 분석) ──
+        const reasons = Array.isArray(item.reasons) ? item.reasons : [];
+        const stratLabel = currentLang === "ko" ? "기술적 분석" : "Technical";
+        const basisText = reasons.length > 0
+            ? reasons.slice(0, 2).join(" · ") + (reasons.length > 2 ? " …" : "")
+            : (currentLang === "ko" ? "뚜렷한 근거 없음" : "no strong basis");
+        const reasonItems = reasons.length > 0
+            ? reasons.map(r => `<li>${r}</li>`).join("")
+            : `<li class="text-mute">${currentLang === "ko" ? "뚜렷한 신호 근거가 없습니다" : "No strong signal basis"}</li>`;
+        const detailNote = currentLang === "ko"
+            ? "RSI·MACD·이동평균·볼린저밴드·거래량 5개 지표를 종합한 기술적 분석 신호입니다."
+            : "Composite signal from 5 technical indicators: RSI, MACD, moving averages, Bollinger Bands, volume.";
 
         return `
-            <div class="scanner-card" onclick="showStockLinks('${item.symbol}', '${(rawName).replace(/'/g, "\\'")}')" style="cursor:pointer;">
-                <div class="scanner-card-header">
-                    <div>
-                        <div class="scanner-card-name">
-                            <span style="font-size:10px;opacity:0.5;margin-right:4px;">${flag}</span>
-                            <strong>${displayName}</strong>
-                            ${displayCode ? `<span style="opacity:0.5;font-size:12px;margin-left:4px;">${displayCode}</span>` : ""}
+            <div class="scanner-card">
+                <div class="scanner-card-body" onclick="toggleScannerCard(this)" style="cursor:pointer;">
+                    <div class="scanner-card-header">
+                        <div>
+                            <div class="scanner-card-name">
+                                <span style="font-size:10px;opacity:0.5;margin-right:4px;">${flag}</span>
+                                <strong>${displayName}</strong>
+                                ${displayCode ? `<span style="opacity:0.5;font-size:12px;margin-left:4px;">${displayCode}</span>` : ""}
+                            </div>
+                            <div class="scanner-card-symbol">${item.symbol} · ${item.sector}</div>
                         </div>
-                        <div class="scanner-card-symbol">${item.symbol} · ${item.sector}</div>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <span class="badge ${badgeClass}">${item.signal}</span>
+                            <span onclick="event.stopPropagation(); showStockLinks('${item.symbol}', '${safeName}')"
+                                  title="${currentLang === "ko" ? "차트·뉴스 링크" : "Charts & news"}"
+                                  style="cursor:pointer;opacity:0.55;font-size:13px;">🔗</span>
+                        </div>
                     </div>
-                    <span class="badge ${badgeClass}">${item.signal}</span>
+                    <div class="scanner-card-metrics">
+                        <span>${currentLang === "ko" ? "현재가" : "Price"}: <span class="metric-value">${item.price.toLocaleString()}</span></span>
+                        <span class="${changeClass}">${changeSign}${item.change_1d}%</span>
+                        <span>RSI: <span class="metric-value" style="color:${item.rsi > 70 ? 'var(--danger)' : item.rsi < 30 ? 'var(--success)' : 'inherit'}">${item.rsi}</span></span>
+                        <span>${currentLang === "ko" ? "강도" : "Str"}: ${(item.strength * 100).toFixed(0)}%</span>
+                    </div>
+                    <div class="scanner-card-basis">🧠 ${stratLabel} · ${basisText}
+                        <span class="scanner-card-toggle">${currentLang === "ko" ? "▾ 근거 보기" : "▾ details"}</span>
+                    </div>
                 </div>
-                <div class="scanner-card-metrics">
-                    <span>${currentLang === "ko" ? "현재가" : "Price"}: <span class="metric-value">${item.price.toLocaleString()}</span></span>
-                    <span class="${changeClass}">${changeSign}${item.change_1d}%</span>
-                    <span>RSI: <span class="metric-value" style="color:${item.rsi > 70 ? 'var(--danger)' : item.rsi < 30 ? 'var(--success)' : 'inherit'}">${item.rsi}</span></span>
-                    <span>${currentLang === "ko" ? "강도" : "Str"}: ${(item.strength * 100).toFixed(0)}%</span>
+                <div class="scanner-card-detail" style="display:none;">
+                    <div class="scanner-detail-title">📋 ${currentLang === "ko" ? "판단 근거" : "Signal Basis"} — ${stratLabel}</div>
+                    <ul class="scanner-reason-list">${reasonItems}</ul>
+                    <div class="scanner-detail-note">⚙️ ${detailNote}</div>
                 </div>
             </div>
         `;
     }).join("")}</div>`;
+}
+
+/**
+ * toggleScannerCard() - 스캐너 카드의 판단 근거 상세를 펼치기/접기
+ */
+function toggleScannerCard(bodyEl) {
+    const card = bodyEl.closest(".scanner-card");
+    if (!card) return;
+    const detail = card.querySelector(".scanner-card-detail");
+    const toggle = card.querySelector(".scanner-card-toggle");
+    if (!detail) return;
+    const isOpen = detail.style.display === "block";
+    detail.style.display = isOpen ? "none" : "block";
+    card.classList.toggle("expanded", !isOpen);
+    if (toggle) {
+        toggle.textContent = isOpen
+            ? (currentLang === "ko" ? "▾ 근거 보기" : "▾ details")
+            : (currentLang === "ko" ? "▴ 접기" : "▴ collapse");
+    }
 }
 
 /**
@@ -3041,6 +3111,9 @@ async function loadRecentTrades() {
             const posType = t.position_type || "";
             const posTypeEn = posType === "단타" ? "short" : posType === "장기" ? "long" : "swing";
             const typeBadge = posType ? ` <span class="position-type-badge position-type-${posTypeEn}">${posType}</span>` : "";
+            // ★ 손익 셀 — 헤더가 8칸(...총액·손익·전략)이므로 손익 td 필수
+            // 빠지면 전략이 손익 칸으로 밀려 컬럼 전체가 어긋남
+            const pnlCell = renderPnlCell(t);
             return `<tr>
                 <td>${formatTime(t.timestamp)}</td>
                 <td class="clickable" style="font-weight:600;" onclick="showStockLinks('${t.symbol}', '${displayName.replace(/'/g, "\\'")}')">${displayName}${typeBadge}</td>
@@ -3048,6 +3121,7 @@ async function loadRecentTrades() {
                 <td>${t.quantity}</td>
                 <td>${Number(t.price).toFixed(2)}</td>
                 <td>${formatCurrency(total)}</td>
+                <td>${pnlCell}</td>
                 <td class="text-mute">${t.strategy || "-"}</td>
             </tr>`;
         }).join("");

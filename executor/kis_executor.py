@@ -73,7 +73,9 @@ class KISExecutor(BaseExecutor):
         app_key: Optional[str] = None,
         app_secret: Optional[str] = None,
         account: Optional[str] = None,
-        paper: bool = True
+        paper: bool = True,
+        db=None,
+        fill_poll_seconds: float = 5.0,
     ):
         """
         Parameters:
@@ -81,6 +83,8 @@ class KISExecutor(BaseExecutor):
             app_secret: 한투 APP SECRET
             account: 계좌번호 (예: "50012345-01")
             paper: True=모의투자, False=실거래
+            db: DatabaseManager 인스턴스 (체결 시 자동으로 trades 테이블에 기록)
+            fill_poll_seconds: submit 후 체결 폴링 시간 (시장가 평균 1-3초, 한도 5초)
         """
         super().__init__(name="kis", paper=paper)
 
@@ -153,6 +157,16 @@ class KISExecutor(BaseExecutor):
         # 수정: 각 호출의 성공/실패를 기록. 봇이 이중 매수 위험 판단에 사용
         self._last_positions_call_ok: bool = True   # 최근 get_positions 성공 여부
         self._last_account_call_ok: bool = True     # 최근 get_account 성공 여부
+
+        # ── ★ 체결 확정 폴링 + DB 기록 ──
+        # KIS submit_order는 SUBMITTED만 반환 (FILLED 아님). 시장가는 보통 1-3초에 체결되므로
+        # 짧게 폴링해서 FILLED로 갱신해야 caller가 정상 분기를 탈 수 있음.
+        # 폴링 안 하면: ExitManager 등록 안 됨 + SafetyGuard PnL 누락 + DB 거래 미기록.
+        self.db = db
+        self.fill_poll_seconds = fill_poll_seconds
+        # 체결 시점 trade_history 메모리 (paper_executor 호환)
+        # 호출자가 hasattr(executor, 'trade_history')로 체크함
+        self.trade_history: List[Dict] = []
 
     @staticmethod
     def _strip_suffix(symbol: str) -> str:
@@ -803,8 +817,249 @@ class KISExecutor(BaseExecutor):
                 logger.error(f"[KIS] HTTP {response.status_code} 주문 실패: {response.text[:200]}")
             order.status = OrderStatus.REJECTED
 
+        # ── ★ CRITICAL FIX (Phase 12): SUBMITTED 후 체결 확정 폴링 ──
+        # 이전 버그: 여기서 self.get_positions()를 호출해 pre_sell_avg를 조회했는데
+        # API 실패 시 self._last_positions_call_ok=False가 설정되어
+        # → 같은 사이클의 후속 매수 신호가 silent하게 차단됨
+        # 수정: pre_sell_avg는 order.avg_price_hint에 caller가 미리 넣어 전달
+        #       (run_bot._execute_sell이 held.avg_price를 전달)
+        if order.status == OrderStatus.SUBMITTED and order.order_id:
+            pre_sell_avg = getattr(order, "avg_price_hint", 0.0) or 0.0
+            self._poll_fill_and_record(order, pre_sell_avg_price=pre_sell_avg)
+
         self.orders.append(order)
         return order
+
+    @staticmethod
+    def _safe_int(v, default: int = 0) -> int:
+        """KIS 응답의 문자열/None/빈문자열을 안전하게 int로 변환"""
+        if v is None or v == "" or v == " ":
+            return default
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _safe_float(v, default: float = 0.0) -> float:
+        """KIS 응답의 문자열/None/빈문자열을 안전하게 float로 변환"""
+        if v is None or v == "" or v == " ":
+            return default
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return default
+
+    def _poll_fill_and_record(self, order: Order, max_wait_sec: Optional[float] = None,
+                               pre_sell_avg_price: float = 0.0) -> None:
+        """
+        주문 제출 후 체결 상태를 짧게 폴링하여 FILLED/PARTIAL로 갱신 + DB/메모리 기록
+
+        ★ Phase 11 안정화:
+          - filled_price 추출: tot_ccld_amt / tot_ccld_qty 우선 (avg_prvs는 0일 수 있음)
+          - 안전 형변환: 빈 문자열/None → 0 (이전 ValueError로 silent SUBMITTED)
+          - 매도 실현 PnL: pre_sell_avg_price를 받아 DB에도 정확히 기록
+          - 폴링 1초 간격 (KIS 1/sec 한도 준수, 기본 5초→총 5회 호출)
+          - PARTIAL도 FILLED와 동일하게 caller가 처리 가능하도록 일단 FILLED로 승격
+            (caller `_execute_buy/_execute_sell`은 `== "filled"`만 검사하므로
+             PARTIAL을 그대로 두면 ExitManager 미등록 → 손절 안 됨)
+
+        Parameters:
+            order: 제출된 주문 (status=SUBMITTED, order_id 설정됨)
+            max_wait_sec: 폴링 최대 대기 시간 (기본 self.fill_poll_seconds)
+            pre_sell_avg_price: 매도 전 보유 평균매수가 (실현PnL 정확 계산용)
+                               caller가 get_positions()로 조회 후 전달
+
+        체결 확정 시:
+        1. order.status = FILLED + filled_price 갱신
+        2. trade_history.append (memory)
+        3. db.log_trade with realized_pnl (있으면)
+        """
+        max_wait = max_wait_sec if max_wait_sec is not None else self.fill_poll_seconds
+        start = time.time()
+        last_status = OrderStatus.SUBMITTED
+        filled_qty = 0
+        filled_price = 0.0
+        partial_fill_warning = False
+
+        # KIS 1/sec 한도 준수: 1초 간격으로 폴링 (5초 max = 5회)
+        POLL_INTERVAL_SEC = 1.0
+
+        while (time.time() - start) < max_wait:
+            try:
+                # ★ Phase 11: 날짜는 KST 기준 (서버 TZ가 UTC면 자정~09KST 사이 잘못된 날짜)
+                try:
+                    from utils.timezones import now_kst
+                    kst_today = now_kst().strftime("%Y%m%d")
+                except ImportError:
+                    kst_today = datetime.now().strftime("%Y%m%d")
+
+                tr_id = "VTTC8001R" if self.paper else "TTTC8001R"
+                url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+                params = {
+                    "CANO": self.cano,
+                    "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                    "INQR_STRT_DT": kst_today,
+                    "INQR_END_DT": kst_today,
+                    "SLL_BUY_DVSN_CD": "00",
+                    "INQR_DVSN": "00",
+                    "PDNO": self._strip_suffix(order.symbol),
+                    "CCLD_DVSN": "00",
+                    "ORD_GNO_BRNO": "",
+                    "ODNO": order.order_id,
+                    "INQR_DVSN_3": "00",
+                    "INQR_DVSN_1": "",
+                    "CTX_AREA_FK100": "",
+                    "CTX_AREA_NK100": "",
+                }
+                headers = self._get_headers(tr_id)
+                sess = self.session or requests
+                r = sess.get(url, headers=headers, params=params, timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("rt_cd") == "0":
+                        for item in data.get("output1", []):
+                            if item.get("odno") != order.order_id:
+                                continue
+
+                            # ★ 안전 형변환 (빈 문자열 → 0)
+                            fq = self._safe_int(item.get("tot_ccld_qty"))
+                            oq = self._safe_int(item.get("ord_qty"))
+                            tot_amt = self._safe_float(item.get("tot_ccld_amt"))
+                            avg = self._safe_float(item.get("avg_prvs"))
+                            unpr = self._safe_float(item.get("ord_unpr"))
+
+                            # ★ Phase 11 C2 FIX: fill_price 정확 추출
+                            # 우선순위: 1) tot_amt/qty (실제 체결 평균)
+                            #          2) avg_prvs (KIS가 채워준 평균, 미체결 시 0)
+                            #          3) unpr (지정가 주문 한정, 시장가는 0)
+                            if fq > 0 and tot_amt > 0:
+                                computed_price = tot_amt / fq
+                            elif avg > 0:
+                                computed_price = avg
+                            elif unpr > 0:
+                                computed_price = unpr
+                            else:
+                                computed_price = 0.0  # 아직 모름
+
+                            # 취소 확인
+                            if item.get("cncl_yn", "N") == "Y":
+                                last_status = OrderStatus.CANCELLED
+                                break
+
+                            # FILLED 확정 — qty만 채워졌으면 일단 FILLED 승격
+                            # 가격은 다음 폴링에서 갱신 가능
+                            if fq >= oq and oq > 0:
+                                last_status = OrderStatus.FILLED
+                                filled_qty = fq
+                                if computed_price > 0:
+                                    filled_price = computed_price
+                                break
+                            elif fq > 0:
+                                # PARTIAL: 일부만 체결 → 계속 폴링하면서 추적
+                                filled_qty = fq
+                                if computed_price > 0:
+                                    filled_price = computed_price
+                                partial_fill_warning = True
+                                last_status = OrderStatus.PARTIAL
+                            break  # 같은 ODNO 더 이상 없음
+                        if last_status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+                            break
+            except Exception as e:
+                logger.debug(f"[KIS] 체결 폴링 중 예외 (계속): {e}")
+            time.sleep(POLL_INTERVAL_SEC)
+
+        # ── Phase 11 H1 FIX: PARTIAL은 FILLED로 승격 처리 ──
+        # caller(_execute_buy 등)가 `== "filled"`만 체크하므로, PARTIAL이면
+        # 일부는 체결됐는데 ExitManager 미등록 → 손절 안 되는 위험.
+        # 일부 체결이라도 포지션은 발생했으므로 caller가 인식하도록 FILLED 처리.
+        # 단, filled_quantity는 실제 체결분만 반영하여 caller가 정확한 수량 사용.
+        if last_status == OrderStatus.PARTIAL and filled_qty > 0:
+            logger.warning(
+                f"[KIS] {order.symbol} 부분 체결: {filled_qty}/{order.quantity}주 "
+                f"— FILLED로 승격하여 ExitManager 등록 보장. ODNO={order.order_id}"
+            )
+            last_status = OrderStatus.FILLED
+
+        order.status = last_status
+
+        # ★ Phase 11 L3 FIX: filled_quantity는 FILLED/PARTIAL일 때만 의미 있음
+        if last_status == OrderStatus.FILLED:
+            order.filled_quantity = filled_qty
+        else:
+            order.filled_quantity = 0
+
+        # FILLED 처리 — 단, filled_price가 0이면 DB/메모리 기록 안 함 (잘못된 데이터 방지)
+        if last_status == OrderStatus.FILLED:
+            if filled_price <= 0:
+                # 체결은 됐는데 가격을 못 찾음 — 다음 사이클에서 reconcile로 보정
+                logger.warning(
+                    f"[KIS] {order.symbol} 체결 확인되었으나 평균가 미수신 "
+                    f"(qty={filled_qty}) → DB 기록 보류, reconcile에서 보정 필요"
+                )
+                # status는 FILLED 유지 (caller가 ExitManager 등록 등을 진행하도록)
+                # 가격은 cached_price (caller가 갖고 있음) 사용 가능
+                return
+
+            order.filled_price = filled_price
+            order.filled_at = datetime.now()
+
+            # ★ Phase 11 BUG-1 FIX: 매도 실현 PnL 계산 (DB에도 정확히 기록)
+            realized_pnl = 0.0
+            if order.side == OrderSide.SELL and pre_sell_avg_price > 0:
+                # KIS는 KRW이므로 그대로 (price - avg) × qty
+                realized_pnl = (filled_price - pre_sell_avg_price) * filled_qty
+
+            # ── 메모리 trade_history 기록 (caller 호환) ──
+            try:
+                self.trade_history.append({
+                    "order_id": order.order_id,
+                    "symbol": order.symbol,
+                    "side": order.side.value,
+                    "quantity": filled_qty,
+                    "price": filled_price,
+                    "total": filled_qty * filled_price,
+                    "fee": 0.0,  # KIS는 별도 조회 — 0으로 보고
+                    "strategy": order.strategy or "",
+                    "timestamp": order.filled_at,
+                    "realized_pnl": realized_pnl,
+                })
+            except Exception as e:
+                logger.debug(f"[KIS] trade_history 기록 실패 (무시): {e}")
+
+            # ── DB 거래 기록 ──
+            if self.db is not None:
+                try:
+                    market = "KR"
+                    decision_json = getattr(order, "decision_json", None) or "{}"
+                    self.db.log_trade(
+                        symbol=order.symbol,
+                        side=order.side.value.upper(),
+                        quantity=filled_qty,
+                        price=filled_price,
+                        strategy=order.strategy or "",
+                        market=market,
+                        order_id=order.order_id,
+                        pnl=realized_pnl,  # ★ 정확한 실현 PnL
+                        total_value=filled_qty * filled_price,
+                        decision_json=decision_json,
+                        mode=self.mode,
+                    )
+                    logger.info(
+                        f"[KIS] 체결 + DB 기록: {order.symbol} {order.side.value} "
+                        f"{filled_qty}주 @ ₩{filled_price:,.0f}"
+                        + (f" | 실현PnL ₩{realized_pnl:,.0f}" if realized_pnl != 0 else "")
+                        + f" (ODNO={order.order_id})"
+                    )
+                except Exception as e:
+                    logger.error(f"[KIS] DB log_trade 실패: {e}")
+        elif last_status == OrderStatus.SUBMITTED:
+            # ★ Phase 11 BUG-3: 폴링 만료 후에도 SUBMITTED — 다음 사이클에서 재확인
+            # caller는 이 주문을 자체 추적해야 함 (현재는 _recent_orders에 기록됨)
+            logger.warning(
+                f"[KIS] {order.symbol} 주문 폴링 {max_wait:.0f}초 만료 — 여전히 SUBMITTED. "
+                f"다음 분석 사이클에서 reconcile로 확인 예정. ODNO={order.order_id}"
+            )
 
     def cancel_order(self, order_id: str, original_ord_dvsn: Optional[str] = None) -> bool:
         """
@@ -1178,10 +1433,20 @@ class KISExecutor(BaseExecutor):
                 if output2:
                     summary = output2[0]
                     self._last_account_call_ok = True
+                    # ★ 현금: 가수도정산금액(prvs_rcdl_excc_amt, D+2 정산) 사용.
+                    #   당일 매수·매도가 즉시 반영돼 매수 직후 현금이 줄어든다.
+                    #   이전 버그: dnca_tot_amt(예수금총금액)는 T+2 정산 전까지
+                    #   안 줄어 "주식 샀는데 현금 변동 없음"으로 보였음.
+                    #   buying_power도 nass_amt(순자산=현금+주식)는 매수해도
+                    #   거의 안 변해 잘못 → 정산 반영 현금으로 통일.
+                    _cash_raw = summary.get("prvs_rcdl_excc_amt")
+                    if _cash_raw in (None, ""):
+                        _cash_raw = summary.get("dnca_tot_amt", 0)
+                    cash_amt = self._safe_float(_cash_raw)
                     return AccountInfo(
                         total_equity=float(summary.get("tot_evlu_amt", 0)),
-                        cash=float(summary.get("dnca_tot_amt", 0)),
-                        buying_power=float(summary.get("nass_amt", 0)),
+                        cash=cash_amt,
+                        buying_power=cash_amt,  # 주문가능 현금 = 정산 반영 현금
                         positions_value=float(summary.get("scts_evlu_amt", 0)),
                         currency="KRW",
                     )
