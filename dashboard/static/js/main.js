@@ -429,9 +429,12 @@ socket.on("trade_executed", (trade) => {
     );
 
     // 거래 탭이 현재 보이고 있으면 자동 새로고침
+    // ★ DB 기반 loadTrades() 사용 — /api/trades/recent(메모리)는 전략·유형·손익
+    //   필드가 누락돼 표기가 부정확했음(수동 새로고침 눌러야 제대로 보이던 버그).
+    //   체결 시점엔 이미 DB에 log_trade가 끝나 있어 DB가 최신 → 새로고침과 동일 표기.
     const tradesSection = document.getElementById("tab-trades");
     if (tradesSection && tradesSection.style.display !== "none") {
-        loadRecentTrades();
+        loadTrades();
     }
 
     // 메인 대시보드의 "최근 거래" 위젯 갱신 (항상 갱신)
@@ -478,7 +481,7 @@ document.querySelectorAll(".tab").forEach(tab => {
         document.querySelectorAll("section[id^='tab-']").forEach(s => s.style.display = "none");
         tab.classList.add("active");
         document.getElementById("tab-" + tab.dataset.tab).style.display = "block";
-        if (tab.dataset.tab === "trades") { loadRecentTrades(); loadReportsList(); }
+        if (tab.dataset.tab === "trades") { loadTrades(); loadReportsList(); }
         if (tab.dataset.tab === "charts") { loadChartsTab(); }
     });
 });
@@ -792,6 +795,164 @@ function updateSignals(signals) {
     }).join("");
 }
 
+// ─── 종목별 포지션 한도 오버라이드 ───────────────────────────────
+// 사용자가 등록한 종목만 max_position_size 대신 별도 한도를 적용.
+// 형식: {"005930.KS": 0.30, "AAPL": 0.15} (분율, 1~50% = 0.01~0.50)
+function addPositionLimitOverride(symbol = "", percent = "") {
+    const list = document.getElementById("positionLimitOverrideList");
+    if (!list) return;
+    const row = document.createElement("div");
+    row.className = "pos-limit-row";
+    row.style.cssText = "display:flex;gap:8px;margin-bottom:6px;align-items:center;";
+    // textContent으로 안전 삽입(템플릿 인젝션 방지)
+    const symInput = document.createElement("input");
+    symInput.type = "text";
+    symInput.className = "form-input override-symbol";
+    symInput.placeholder = "예: 005930.KS";
+    symInput.value = symbol;
+    symInput.maxLength = 20;
+    symInput.style.cssText = "flex:1;max-width:200px;text-transform:uppercase;";
+    const pctInput = document.createElement("input");
+    pctInput.type = "number";
+    pctInput.className = "form-input override-limit";
+    pctInput.placeholder = "30";
+    pctInput.value = percent;
+    pctInput.min = "1";
+    pctInput.max = "50";
+    pctInput.step = "1";
+    pctInput.style.cssText = "width:80px;text-align:right;";
+    const pctLabel = document.createElement("span");
+    pctLabel.style.cssText = "color:rgba(255,255,255,0.6);font-size:13px;";
+    pctLabel.textContent = "%";
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.textContent = "✕";
+    delBtn.style.cssText = "background:rgba(255,80,80,0.2);border:1px solid rgba(255,80,80,0.4);border-radius:6px;color:#fff;padding:4px 10px;cursor:pointer;font-size:13px;";
+    delBtn.onclick = () => row.remove();
+    row.appendChild(symInput);
+    row.appendChild(pctInput);
+    row.appendChild(pctLabel);
+    row.appendChild(delBtn);
+    list.appendChild(row);
+}
+
+function loadPositionLimitOverrides(map) {
+    const list = document.getElementById("positionLimitOverrideList");
+    if (!list) return;
+    list.innerHTML = "";
+    if (!map || typeof map !== "object") return;
+    Object.entries(map).forEach(([sym, frac]) => {
+        const pct = Math.round((parseFloat(frac) || 0) * 100);
+        if (pct >= 1 && pct <= 50) {
+            addPositionLimitOverride(sym, pct);
+        }
+    });
+}
+
+function collectPositionLimitOverrides() {
+    const list = document.getElementById("positionLimitOverrideList");
+    if (!list) return {};
+    const result = {};
+    list.querySelectorAll(".pos-limit-row").forEach(row => {
+        const symEl = row.querySelector(".override-symbol");
+        const pctEl = row.querySelector(".override-limit");
+        if (!symEl || !pctEl) return;
+        const sym = (symEl.value || "").trim().toUpperCase();
+        const pctVal = parseInt(pctEl.value, 10);
+        if (!sym) return;
+        if (isNaN(pctVal) || pctVal < 1 || pctVal > 50) return;
+        result[sym] = pctVal / 100.0;
+    });
+    return result;
+}
+
+// ─── 자본 배분 슬리브 ───────────────────────────────────────────────
+var SLEEVE_KEYS = ["momentum", "mean_reversion", "factor", "technical", "sentiment", "ensemble"];
+var SLEEVE_NAMES = {
+    momentum: "모멘텀", mean_reversion: "평균회귀", factor: "팩터",
+    technical: "기술적", sentiment: "감성", ensemble: "앙상블",
+};
+
+// 모드(앙상블/슬리브)에 따라 비중 편집 박스 표시/숨김
+function updateSleeveWeightVisibility() {
+    var mode = document.getElementById("allocModeSelect");
+    var box = document.getElementById("sleeveWeightsBox");
+    if (!mode || !box) return;
+    box.style.display = (mode.value === "sleeves") ? "block" : "none";
+    if (mode.value === "sleeves") updateSleeveWeightHint();
+}
+
+// 슬리브 비중 입력 → 정규화된 실제 적용 비중 안내
+function updateSleeveWeightHint() {
+    var hint = document.getElementById("sleeveWeightHint");
+    if (!hint) return;
+    var sum = 0, active = [];
+    SLEEVE_KEYS.forEach(function (k) {
+        var el = document.getElementById("sleeveW_" + k);
+        var v = el ? parseFloat(el.value) : 0;
+        if (isNaN(v) || v < 0) v = 0;
+        sum += v;
+        if (v > 0) active.push({ k: k, v: v });
+    });
+    if (active.length === 0 || sum <= 0) {
+        hint.innerHTML = "⚠️ 활성 전략이 없습니다 — 이 상태로 저장하면 앙상블로 폴백됩니다.";
+        hint.style.color = "#f5a623";
+        return;
+    }
+    var eff = active.map(function (a) {
+        return SLEEVE_NAMES[a.k] + " " + Math.round(a.v / sum * 100) + "%";
+    }).join(" / ");
+    hint.innerHTML = "💡 입력 합계 " + sum + "% · 실제 적용(정규화): <b>" + eff + "</b>";
+    hint.style.color = "rgba(255,255,255,0.6)";
+}
+
+function collectSleeveWeights() {
+    var out = {};
+    SLEEVE_KEYS.forEach(function (k) {
+        var el = document.getElementById("sleeveW_" + k);
+        if (el) {
+            var v = parseInt(el.value, 10);
+            if (!isNaN(v) && v > 0) out[k] = Math.min(100, v);
+        }
+    });
+    return out;
+}
+
+// 분석 모듈 가중치 입력에 따라 안내 문구를 실시간 갱신.
+// 활성 모듈 기준으로 정규화된 '실제 적용 비중'을 보여준다.
+// (백엔드 EnsembleConfig.get_effective_weights와 동일한 정규화 로직)
+function updateModuleWeightHint() {
+    const hint = document.getElementById("moduleWeightHint");
+    if (!hint) return;
+    const mods = [
+        { name: "기술", chk: "modTechnicalEnabled", wt: "modTechnicalWeight" },
+        { name: "팩터", chk: "modFactorEnabled", wt: "modFactorWeight" },
+        { name: "감성", chk: "modSentimentEnabled", wt: "modSentimentWeight" },
+    ];
+    let rawSum = 0;
+    const active = [];
+    mods.forEach((m) => {
+        const wtEl = document.getElementById(m.wt);
+        const chkEl = document.getElementById(m.chk);
+        let w = wtEl ? parseFloat(wtEl.value) : 0;
+        if (isNaN(w) || w < 0) w = 0;
+        rawSum += w;
+        if (chkEl && chkEl.checked && w > 0) active.push({ name: m.name, w: w });
+    });
+    const activeSum = active.reduce((s, m) => s + m.w, 0);
+    if (active.length === 0 || activeSum <= 0) {
+        hint.innerHTML = "⚠️ 활성 모듈이 없거나 가중치 합이 0입니다 — 이 상태로는 매매 신호가 생성되지 않습니다.";
+        hint.style.color = "#f5a623";
+        return;
+    }
+    const effStr = active
+        .map((m) => m.name + " " + Math.round((m.w / activeSum) * 100) + "%")
+        .join(" / ");
+    hint.innerHTML = "💡 입력 합계 " + rawSum
+        + "% · 실제 적용(활성 모듈 자동 정규화): <b>" + effStr + "</b>";
+    hint.style.color = "rgba(255,255,255,0.6)";
+}
+
 function updateSettingsUI(settings) {
     document.getElementById("settingBroker").value = settings.broker || "paper";
     document.getElementById("settingCapital").value = settings.capital || 10000000;
@@ -855,6 +1016,48 @@ function updateSettingsUI(settings) {
     if (modFactor) modFactor.checked = settings.module_factor_enabled !== false;
     const modSent = document.getElementById("modSentimentEnabled");
     if (modSent) modSent.checked = settings.module_sentiment_enabled !== false;
+
+    // ── 분석 모듈 가중치(%) 반영 ──
+    const modTechWt = document.getElementById("modTechnicalWeight");
+    if (modTechWt) modTechWt.value = settings.module_technical_weight != null ? settings.module_technical_weight : 45;
+    const modFactorWt = document.getElementById("modFactorWeight");
+    if (modFactorWt) modFactorWt.value = settings.module_factor_weight != null ? settings.module_factor_weight : 35;
+    const modSentWt = document.getElementById("modSentimentWeight");
+    if (modSentWt) modSentWt.value = settings.module_sentiment_weight != null ? settings.module_sentiment_weight : 20;
+    updateModuleWeightHint();
+
+    // ── 종목별 포지션 한도 오버라이드 반영 ──
+    loadPositionLimitOverrides(settings.position_limit_overrides || {});
+
+    // ── 뉴스 분석 기간 (일) 반영 ──
+    const newsAgeEl = document.getElementById("settingNewsMaxAge");
+    if (newsAgeEl) newsAgeEl.value = settings.news_max_age_days != null ? settings.news_max_age_days : 5;
+
+    // ── 매도 규칙 (시간 청산 + 절대 손절선) 반영 ──
+    const tsEnableEl = document.getElementById("settingEnableTimeStop");
+    if (tsEnableEl) tsEnableEl.checked = settings.enable_time_stop !== false;
+    const tsShortEl = document.getElementById("settingTimeStopShort");
+    if (tsShortEl) tsShortEl.value = settings.time_stop_days_short != null ? settings.time_stop_days_short : 3;
+    const tsSwingEl = document.getElementById("settingTimeStopSwing");
+    if (tsSwingEl) tsSwingEl.value = settings.time_stop_days_swing != null ? settings.time_stop_days_swing : 30;
+    const tsLongEl = document.getElementById("settingTimeStopLong");
+    if (tsLongEl) tsLongEl.value = settings.time_stop_days_long != null ? settings.time_stop_days_long : 180;
+    const hardStopEl = document.getElementById("settingHardStopPct");
+    if (hardStopEl) hardStopEl.value = settings.hard_stop_loss_pct != null ? settings.hard_stop_loss_pct : 0;
+
+    // ── 자본 배분 모드 + 슬리브 비중 반영 ──
+    const allocModeEl = document.getElementById("allocModeSelect");
+    if (allocModeEl) allocModeEl.value = settings.allocation_mode || "ensemble";
+    const _sw = settings.strategy_weights || {};
+    SLEEVE_KEYS.forEach(function (k) {
+        const el = document.getElementById("sleeveW_" + k);
+        if (el) {
+            let v = _sw[k] != null ? _sw[k] : 0;
+            if (v > 0 && v <= 1) v = Math.round(v * 100);  // 분율로 저장된 경우 % 보정
+            el.value = v;
+        }
+    });
+    updateSleeveWeightVisibility();
 
     // ── 종목 발굴 설정 반영 ──
     const discoveryEnabledEl = document.getElementById("discoveryEnabled");
@@ -1188,6 +1391,38 @@ async function saveSettings() {
             document.getElementById("modFactorEnabled").checked : true,
         module_sentiment_enabled: document.getElementById("modSentimentEnabled") ?
             document.getElementById("modSentimentEnabled").checked : true,
+
+        // ── 분석 모듈 가중치(%) — 활성 모듈 기준 자동 정규화 ──
+        module_technical_weight: document.getElementById("modTechnicalWeight") ?
+            Math.min(100, Math.max(0, parseInt(document.getElementById("modTechnicalWeight").value) || 0)) : 45,
+        module_factor_weight: document.getElementById("modFactorWeight") ?
+            Math.min(100, Math.max(0, parseInt(document.getElementById("modFactorWeight").value) || 0)) : 35,
+        module_sentiment_weight: document.getElementById("modSentimentWeight") ?
+            Math.min(100, Math.max(0, parseInt(document.getElementById("modSentimentWeight").value) || 0)) : 20,
+
+        // ── 종목별 포지션 한도 오버라이드 (선택) ──
+        position_limit_overrides: collectPositionLimitOverrides(),
+
+        // ── 뉴스 분석 기간 (일) ──
+        news_max_age_days: document.getElementById("settingNewsMaxAge") ?
+            Math.min(30, Math.max(0, parseInt(document.getElementById("settingNewsMaxAge").value, 10) || 5)) : 5,
+
+        // ── 매도 규칙 (시간 청산 + 절대 손절선) ──
+        enable_time_stop: document.getElementById("settingEnableTimeStop") ?
+            document.getElementById("settingEnableTimeStop").checked : true,
+        time_stop_days_short: document.getElementById("settingTimeStopShort") ?
+            Math.min(60, Math.max(1, parseInt(document.getElementById("settingTimeStopShort").value, 10) || 3)) : 3,
+        time_stop_days_swing: document.getElementById("settingTimeStopSwing") ?
+            Math.min(180, Math.max(1, parseInt(document.getElementById("settingTimeStopSwing").value, 10) || 30)) : 30,
+        time_stop_days_long: document.getElementById("settingTimeStopLong") ?
+            Math.min(730, Math.max(1, parseInt(document.getElementById("settingTimeStopLong").value, 10) || 180)) : 180,
+        hard_stop_loss_pct: document.getElementById("settingHardStopPct") ?
+            Math.min(50, Math.max(0, parseInt(document.getElementById("settingHardStopPct").value, 10) || 0)) : 0,
+
+        // ── 자본 배분 모드 + 슬리브 비중 ──
+        allocation_mode: document.getElementById("allocModeSelect") ?
+            document.getElementById("allocModeSelect").value : "ensemble",
+        strategy_weights: collectSleeveWeights(),
 
         // ── 종목 발굴 설정 ──
         discovery_enabled: document.getElementById("discoveryEnabled") ?
@@ -2365,16 +2600,29 @@ async function runScanner() {
     const container = document.getElementById("scannerResults");
     const statusEl = document.getElementById("scannerStatus");
 
+    // ── 선택된 분석 모듈 수집 ──
+    // 토글에 따라 modules 쿼리 파라미터 구성. 최소 1개는 활성 (기본 technical).
+    const modules = [];
+    if (document.getElementById("scanModuleTechnical")?.checked) modules.push("technical");
+    if (document.getElementById("scanModuleFactor")?.checked) modules.push("factor");
+    if (document.getElementById("scanModuleSentiment")?.checked) modules.push("sentiment");
+    if (modules.length === 0) {
+        modules.push("technical");
+        const t = document.getElementById("scanModuleTechnical");
+        if (t) t.checked = true;
+    }
+    const modulesQuery = modules.join(",");
+
     // 로딩 표시
     container.innerHTML = `<div class="scanner-loading"><div class="spinner"></div><span>${i18n.scanner_scanning[currentLang]}</span></div>`;
     if (statusEl) statusEl.textContent = "";
 
     try {
-        const res = await fetch("/api/scanner");
+        const res = await fetch(`/api/scanner?modules=${encodeURIComponent(modulesQuery)}`);
         const data = await res.json();
 
         if (data.scanning && (!data.results || data.results.length === 0)) {
-            // 아직 스캔 중 → 5초 후 재시도
+            // 아직 스캔 중 → 5초 후 재시도 (같은 modules 조합 유지)
             setTimeout(runScanner, 5000);
             return;
         }
@@ -4167,18 +4415,76 @@ function renderMarketCalendar() {
     }
 
     // 날짜 셀
+    // 표시 규칙:
+    //   초록: 거래일 (KR 기준)
+    //   회색: 주말
+    //   빨간 음영: 공휴일·임시휴장 (KR 또는 US)
+    //   파란 테두리: 오늘
+    //   반투명: 지난 날짜
+    //   hover title: 휴일 이름 (KR/US 구분)
     data.days.forEach(function(d) {
-        var bg = d.is_trading ? "rgba(46,204,113,0.15)" : "rgba(255,255,255,0.03)";
-        var color = d.is_trading ? "#2ecc71" : "#666";
+        var isHoliday = !!(d.kr_holiday || d.us_holiday);
+        var bg, color;
+        if (d.is_trading) {
+            bg = "rgba(46,204,113,0.15)";
+            color = "#2ecc71";
+        } else if (isHoliday) {
+            bg = "rgba(231,76,60,0.12)";   // 공휴일 = 옅은 빨강
+            color = "#e74c3c";
+        } else {
+            bg = "rgba(255,255,255,0.03)"; // 주말 = 회색
+            color = "#666";
+        }
         var border = d.is_today ? "2px solid #0070d1" : "2px solid transparent";
-        var opacity = d.is_past && !d.is_today ? "0.4" : "1";
+        var opacity = d.is_past && !d.is_today ? "0.45" : "1";
 
-        html += '<div style="padding:6px 2px;border-radius:6px;background:' + bg +
-            ';color:' + color + ';border:' + border + ';opacity:' + opacity + ';">' +
-            d.day + '</div>';
+        // hover 툴팁
+        var tipParts = [];
+        if (d.kr_holiday) tipParts.push("KR: " + d.kr_holiday);
+        if (d.us_holiday) tipParts.push("US: " + d.us_holiday);
+        var title = tipParts.length ? tipParts.join(" · ")
+                                    : (d.is_trading ? "거래일" : (d.is_weekend ? "주말" : "휴장"));
+
+        // 셀 내부: 날짜 + (있으면) 작은 휴일 마커 점
+        var marker = isHoliday
+            ? '<div style="font-size:8px;line-height:1;margin-top:1px;">●</div>'
+            : '';
+
+        html += '<div title="' + title.replace(/"/g, '&quot;') +
+            '" style="padding:6px 2px;border-radius:6px;background:' + bg +
+            ';color:' + color + ';border:' + border + ';opacity:' + opacity +
+            ';display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:38px;">' +
+            '<div style="font-weight:600;">' + d.day + '</div>' +
+            marker +
+            '</div>';
     });
 
     grid.innerHTML = html;
+
+    // ── 이번 달 휴장일 목록 박스 ──
+    // 캘린더 아래에 KR/US 휴장일 사유까지 명확하게 나열.
+    var listBox = document.getElementById("calendarHolidayList");
+    if (!listBox) {
+        listBox = document.createElement("div");
+        listBox.id = "calendarHolidayList";
+        listBox.style.cssText = "margin-top:12px;font-size:12px;line-height:1.8;";
+        grid.parentNode.appendChild(listBox);
+    }
+    var holidays = data.holidays || [];
+    if (holidays.length === 0) {
+        listBox.innerHTML = '<div style="color:rgba(255,255,255,0.4);">이번 달 공휴일 휴장 없음</div>';
+    } else {
+        var rows = holidays.map(function(h) {
+            var tags = [];
+            if (h.kr) tags.push('<span style="color:#f5a623;">KR ' + h.kr + '</span>');
+            if (h.us) tags.push('<span style="color:#7ed321;">US ' + h.us + '</span>');
+            return '<div>📌 <b>' + h.day + '일 (' + h.weekday + ')</b> &nbsp;'
+                 + tags.join(' · ') + '</div>';
+        }).join("");
+        listBox.innerHTML =
+            '<div style="color:rgba(255,255,255,0.55);margin-bottom:4px;">이번 달 휴장일</div>'
+            + rows;
+    }
 }
 
 // 페이지 로드 시 + 30초마다 장 상태 갱신

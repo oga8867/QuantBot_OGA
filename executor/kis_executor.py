@@ -158,6 +158,25 @@ class KISExecutor(BaseExecutor):
         self._last_positions_call_ok: bool = True   # 최근 get_positions 성공 여부
         self._last_account_call_ok: bool = True     # 최근 get_account 성공 여부
 
+        # ── ★ 조회 결과 단기 캐시 (대시보드 표시 경로 전용 — 레이트리밋 완화) ──
+        # 매매 로직은 get_account()/get_positions()를 그대로 호출(항상 최신)하고,
+        # 브로드캐스터 등 표시 경로만 *_cached()를 호출해 TTL 내 재사용 → KIS 호출 급감.
+        # 성공한 라이브 호출은 항상 캐시를 갱신하므로 표시는 최대 TTL만큼만 지연.
+        self._inquiry_cache_ttl: float = 8.0  # 표시 경로 캐시 TTL(초)
+        # ★ 계좌+포지션 공유 캐시 — get_account/get_positions가 동일 inquire-balance
+        #   엔드포인트를 따로 부르던 중복을 제거. 1회 호출 결과 (acct, positions, ok)를 공유.
+        self._bal_cache = None
+        self._bal_cache_ts: float = 0.0
+
+        # ── ★ 원장(잔고/주문) 엔드포인트 초당 호출 스로틀 (EGW00201 방지) ──
+        # KIS 실전계좌의 원장 조회(inquire-balance)는 초당 한도가 매우 낮다
+        # (시세는 20/초지만 원장은 사실상 ~1/초). 분석 스레드 + 대시보드
+        # 브로드캐스터가 동시에 호출하면 순간 초과 → HTTP 500 EGW00201.
+        # 프로세스(인스턴스) 전역 락으로 호출 간 최소 간격을 강제해 한도를 넘지 않게 한다.
+        self._ledger_lock = threading.Lock()
+        self._last_ledger_ts: float = 0.0
+        self._min_ledger_interval: float = 1.0  # 초 — 원장 호출 최소 간격 (≈1/초)
+
         # ── ★ 체결 확정 폴링 + DB 기록 ──
         # KIS submit_order는 SUBMITTED만 반환 (FILLED 아님). 시장가는 보통 1-3초에 체결되므로
         # 짧게 폴링해서 FILLED로 갱신해야 caller가 정상 분기를 탈 수 있음.
@@ -850,6 +869,85 @@ class KISExecutor(BaseExecutor):
         except (ValueError, TypeError):
             return default
 
+    @staticmethod
+    def _extract_kis_error(response) -> str:
+        """
+        KIS 응답 본문에서 에러코드/메시지를 추출해 로그용 문자열로 반환.
+
+        HTTP 500이어도 본문(JSON)에 msg_cd/msg1이 들어있다 (예: EGW00201=초당
+        거래건수 초과). 레이트리밋으로 보이면 명시적으로 태그를 붙여
+        '서버 문제'와 '호출 과다'를 사용자가 구분할 수 있게 한다.
+        """
+        try:
+            data = response.json()
+            cd = (data.get("msg_cd", "") or "").strip()
+            msg = (data.get("msg1", "") or "").strip()
+            tag = ""
+            if cd in ("EGW00201", "EGW00121", "EGW00133") \
+                    or "초당" in msg or "거래건수" in msg or "유량" in msg:
+                tag = " ⚠️레이트리밋(호출과다 — KIS 서버 문제 아님)"
+            return f" [{cd}] {msg}{tag}"
+        except Exception:
+            try:
+                return f" body={response.text[:200]}"
+            except Exception:
+                return ""
+
+    def _throttle_ledger(self):
+        """
+        원장(잔고/주문) 엔드포인트 초당 호출 제한 — EGW00201(초당 거래건수 초과) 방지.
+
+        프로세스 전역 락으로 직전 호출과 최소 self._min_ledger_interval초 간격을
+        강제한다. 락을 쥔 채 sleep하여 여러 스레드(분석/브로드캐스터)의 호출을
+        직렬화 → 어떤 1초 구간에서도 한도를 넘지 않는다.
+        """
+        with self._ledger_lock:
+            now = time.monotonic()
+            wait = self._min_ledger_interval - (now - self._last_ledger_ts)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_ledger_ts = time.monotonic()
+
+    def _request_with_retry(self, url, headers, params, timeout: float = 10,
+                            retries: int = 1, backoff: float = 0.4):
+        """
+        조회(GET) 요청 + HTTP 비200/네트워크 오류 시 짧은 백오프 후 재시도.
+
+        읽기 전용·멱등이라 재시도가 안전하다. KIS의 일시적 500이나 순간
+        레이트리밋(EGW00201)을 흡수한다. 성공하면 즉시 반환, 최종 실패 시
+        마지막 응답을 반환(호출자가 본문으로 원인 로깅) 또는 예외 전파.
+
+        ★ 매 시도 전 _throttle_ledger()로 원장 호출 간격을 강제 → EGW00201 방지.
+
+        Parameters:
+            retries: 추가 재시도 횟수 (기본 1 → 총 2회 시도)
+            backoff: 재시도 전 대기 초 (레이트리밋이면 즉시 재시도는 악화 → 대기)
+        """
+        sess = self.session or requests
+        last_resp = None
+        for attempt in range(retries + 1):
+            try:
+                self._throttle_ledger()  # 원장 초당 한도 보호
+                last_resp = sess.get(url, headers=headers, params=params, timeout=timeout)
+                if last_resp.status_code == 200:
+                    return last_resp
+                # 비200 → 마지막 시도가 아니면 백오프 후 재시도
+                if attempt < retries:
+                    logger.debug(
+                        f"[KIS] HTTP {last_resp.status_code} → {backoff}s 후 재시도 "
+                        f"({attempt + 1}/{retries})"
+                    )
+                    time.sleep(backoff)
+                    continue
+                return last_resp  # 최종 비200 — 호출자가 _extract_kis_error로 로깅
+            except Exception as e:
+                if attempt < retries:
+                    logger.debug(f"[KIS] 조회 예외({e}) → {backoff}s 후 재시도")
+                    time.sleep(backoff)
+                    continue
+                raise  # 최종 실패 → 호출자의 except가 처리
+        return last_resp
+
     def _poll_fill_and_record(self, order: Order, max_wait_sec: Optional[float] = None,
                                pre_sell_avg_price: float = 0.0) -> None:
         """
@@ -1190,23 +1288,34 @@ class KISExecutor(BaseExecutor):
 
         return OrderStatus.SUBMITTED
 
-    def get_positions(self) -> List[Position]:
+    def _inquire_balance_shared(self, max_age_sec: float = 2.0):
         """
-        보유 포지션 조회
+        inquire-balance를 1회 호출해 (account, positions, ok)를 반환 — 공유 캐시.
 
-        ⚠️ CRITICAL: API 실패 시도 []를 반환하지만, 호출자가 "빈 포지션"과
-        혼동하지 않도록 self._last_positions_call_ok 플래그를 설정합니다.
-        새 매수 결정 시 self.positions_query_succeeded() 확인 필수.
+        ★ EGW00201(원장 초당 한도) 방지의 핵심:
+          get_account(output2)와 get_positions(output1)는 *완전히 동일한*
+          inquire-balance 엔드포인트다. 따로 부르면 원장 호출이 2배가 된다.
+          이 메서드로 1회 호출 결과를 짧게 캐시·공유 → 백투백 호출이 1회로 합쳐짐.
+
+        Parameters:
+            max_age_sec: 이 시간 이내 성공 캐시가 있으면 재사용 (매매=2초, 표시=8초).
+
+        Returns:
+            (AccountInfo, List[Position], ok: bool). 실패 시 (빈 계좌, [], False).
+            성공분만 캐시한다.
         """
+        now = time.monotonic()
+        cached = self._bal_cache
+        if cached is not None and (now - self._bal_cache_ts) < max_age_sec:
+            return cached
+
         if not self._ensure_token():
-            self._last_positions_call_ok = False
-            logger.error("[KIS] 포지션 조회: 토큰 발급/갱신 실패 → 빈 리스트 (API 실패 플래그 ON)")
-            return []
+            logger.error("[KIS] 잔고 조회: 토큰 발급/갱신 실패")
+            return (AccountInfo(currency="KRW"), [], False)
 
         try:
             tr_id = "VTTC8434R" if self.paper else "TTTC8434R"
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-
             params = {
                 "CANO": self.cano,
                 "ACNT_PRDT_CD": self.acnt_prdt_cd,
@@ -1220,33 +1329,28 @@ class KISExecutor(BaseExecutor):
                 "CTX_AREA_FK100": "",
                 "CTX_AREA_NK100": "",
             }
-
             headers = self._get_headers(tr_id)
-            sess = self.session or requests
-            response = sess.get(url, headers=headers, params=params, timeout=10)
+            response = self._request_with_retry(url, headers, params, timeout=10)
 
             if response.status_code != 200:
-                self._last_positions_call_ok = False
-                logger.error(f"[KIS] 포지션 조회 HTTP {response.status_code} → 빈 리스트")
-                return []
+                _detail = self._extract_kis_error(response)
+                logger.error(f"[KIS] 잔고 조회 HTTP {response.status_code}{_detail}")
+                return (AccountInfo(currency="KRW"), [], False)
 
             data = response.json()
             if data.get("rt_cd") != "0":
-                self._last_positions_call_ok = False
                 logger.error(
-                    f"[KIS] 포지션 조회 오류 [{data.get('msg_cd')}]: {data.get('msg1')} → 빈 리스트"
+                    f"[KIS] 잔고 조회 오류 [{data.get('msg_cd')}]: {data.get('msg1')}"
                 )
-                return []
+                return (AccountInfo(currency="KRW"), [], False)
 
+            # output1 → 보유 포지션
             positions = []
             for item in data.get("output1", []):
                 qty = int(item.get("hldg_qty", 0))
                 if qty > 0:
-                    # KIS는 순수 6자리 코드를 반환 -> .KS 접미사 추가하여
-                    # 봇 내부의 심볼 포맷과 일치시킴
                     raw_symbol = item.get("pdno", "")
                     symbol = f"{raw_symbol}.KS" if raw_symbol.isdigit() else raw_symbol
-
                     positions.append(Position(
                         symbol=symbol,
                         quantity=qty,
@@ -1256,14 +1360,43 @@ class KISExecutor(BaseExecutor):
                         market_value=float(item.get("evlu_amt", 0)),
                     ))
 
-            # 성공 — API 정상 동작 확인
-            self._last_positions_call_ok = True
-            return positions
+            # output2 → 계좌 요약
+            acct = AccountInfo(currency="KRW")
+            output2 = data.get("output2", [])
+            if output2:
+                summary = output2[0]
+                # 현금: 가수도정산금액(prvs_rcdl_excc_amt, D+2 정산) 우선
+                _cash_raw = summary.get("prvs_rcdl_excc_amt")
+                if _cash_raw in (None, ""):
+                    _cash_raw = summary.get("dnca_tot_amt", 0)
+                cash_amt = self._safe_float(_cash_raw)
+                acct = AccountInfo(
+                    total_equity=float(summary.get("tot_evlu_amt", 0)),
+                    cash=cash_amt,
+                    buying_power=cash_amt,
+                    positions_value=float(summary.get("scts_evlu_amt", 0)),
+                    currency="KRW",
+                )
+
+            result = (acct, positions, True)
+            self._bal_cache = result
+            self._bal_cache_ts = now
+            return result
 
         except Exception as e:
-            self._last_positions_call_ok = False
-            logger.error(f"[KIS] 포지션 조회 예외: {e}")
-            return []
+            logger.error(f"[KIS] 잔고 조회 예외: {e}")
+            return (AccountInfo(currency="KRW"), [], False)
+
+    def get_positions(self) -> List[Position]:
+        """
+        보유 포지션 조회 (get_account와 동일 엔드포인트 → 공유 캐시 fetch).
+
+        ⚠️ CRITICAL: API 실패 시 []를 반환하지만 self._last_positions_call_ok로
+        "빈 포지션"과 "API 실패"를 구분. 새 매수 결정 시 positions_query_succeeded() 확인.
+        """
+        _acct, positions, ok = self._inquire_balance_shared(max_age_sec=2.0)
+        self._last_positions_call_ok = ok
+        return positions
 
     def positions_query_succeeded(self) -> bool:
         """
@@ -1274,6 +1407,28 @@ class KISExecutor(BaseExecutor):
         새 매수를 보류해야 이중 매수를 방지할 수 있습니다.
         """
         return self._last_positions_call_ok
+
+    def get_account_cached(self) -> AccountInfo:
+        """
+        표시 경로(대시보드 브로드캐스터) 전용 — 더 긴 TTL로 공유 캐시 재사용.
+
+        매매 로직(get_account, max_age 2초)보다 느슨한 8초 TTL로 같은 캐시를
+        재사용해 KIS 호출을 최소화. 성공 시에만 성공 플래그를 갱신(표시 실패가
+        매매 플래그를 오염시키지 않게).
+        """
+        acct, _positions, ok = self._inquire_balance_shared(
+            max_age_sec=self._inquiry_cache_ttl)
+        if ok:
+            self._last_account_call_ok = True
+        return acct
+
+    def get_positions_cached(self) -> List[Position]:
+        """표시 경로 전용 — 8초 TTL로 공유 캐시 재사용 (매매는 get_positions, 2초)."""
+        _acct, positions, ok = self._inquire_balance_shared(
+            max_age_sec=self._inquiry_cache_ttl)
+        if ok:
+            self._last_positions_call_ok = True
+        return positions
 
     def account_query_succeeded(self) -> bool:
         """가장 최근 get_account() 호출이 성공했는지 반환"""
@@ -1388,74 +1543,11 @@ class KISExecutor(BaseExecutor):
 
     def get_account(self) -> AccountInfo:
         """
-        계좌 정보 조회
+        계좌 정보 조회 (get_positions와 동일 inquire-balance → 공유 캐시 fetch).
 
-        ⚠️ API 실패 시도 0짜리 AccountInfo를 반환하지만, 호출자가 "현금 0원"으로
-        오인하지 않도록 self._last_account_call_ok 플래그를 설정합니다.
+        ⚠️ API 실패 시 0짜리 AccountInfo + self._last_account_call_ok=False.
+        호출자가 "현금 0원"과 "API 실패"를 account_query_succeeded()로 구분.
         """
-        if not self._ensure_token():
-            self._last_account_call_ok = False
-            logger.error("[KIS] 계좌 조회: 토큰 발급/갱신 실패")
-            return AccountInfo(currency="KRW")
-
-        try:
-            tr_id = "VTTC8434R" if self.paper else "TTTC8434R"
-            url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-
-            params = {
-                "CANO": self.cano,
-                "ACNT_PRDT_CD": self.acnt_prdt_cd,
-                "AFHR_FLPR_YN": "N",
-                "OFL_YN": "",
-                "INQR_DVSN": "02",
-                "UNPR_DVSN": "01",
-                "FUND_STTL_ICLD_YN": "N",
-                "FNCG_AMT_AUTO_RDPT_YN": "N",
-                "PRCS_DVSN": "01",
-                "CTX_AREA_FK100": "",
-                "CTX_AREA_NK100": "",
-            }
-
-            headers = self._get_headers(tr_id)
-            sess = self.session or requests
-            response = sess.get(url, headers=headers, params=params, timeout=10)
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("rt_cd") != "0":
-                    self._last_account_call_ok = False
-                    logger.error(
-                        f"[KIS] 계좌 조회 오류 [{data.get('msg_cd')}]: {data.get('msg1')}"
-                    )
-                    return AccountInfo(currency="KRW")
-
-                output2 = data.get("output2", [{}])
-                if output2:
-                    summary = output2[0]
-                    self._last_account_call_ok = True
-                    # ★ 현금: 가수도정산금액(prvs_rcdl_excc_amt, D+2 정산) 사용.
-                    #   당일 매수·매도가 즉시 반영돼 매수 직후 현금이 줄어든다.
-                    #   이전 버그: dnca_tot_amt(예수금총금액)는 T+2 정산 전까지
-                    #   안 줄어 "주식 샀는데 현금 변동 없음"으로 보였음.
-                    #   buying_power도 nass_amt(순자산=현금+주식)는 매수해도
-                    #   거의 안 변해 잘못 → 정산 반영 현금으로 통일.
-                    _cash_raw = summary.get("prvs_rcdl_excc_amt")
-                    if _cash_raw in (None, ""):
-                        _cash_raw = summary.get("dnca_tot_amt", 0)
-                    cash_amt = self._safe_float(_cash_raw)
-                    return AccountInfo(
-                        total_equity=float(summary.get("tot_evlu_amt", 0)),
-                        cash=cash_amt,
-                        buying_power=cash_amt,  # 주문가능 현금 = 정산 반영 현금
-                        positions_value=float(summary.get("scts_evlu_amt", 0)),
-                        currency="KRW",
-                    )
-
-            self._last_account_call_ok = False
-            logger.error(f"[KIS] 계좌 조회 HTTP {response.status_code}")
-            return AccountInfo(currency="KRW")
-
-        except Exception as e:
-            self._last_account_call_ok = False
-            logger.error(f"[KIS] 계좌 조회 예외: {e}")
-            return AccountInfo(currency="KRW")
+        acct, _positions, ok = self._inquire_balance_shared(max_age_sec=2.0)
+        self._last_account_call_ok = ok
+        return acct

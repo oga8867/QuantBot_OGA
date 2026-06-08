@@ -280,12 +280,81 @@ def _get_default_settings() -> dict:
         "module_technical_enabled": True,       # 기술적 분석 (RSI, MACD, BB 등)
         "module_factor_enabled": True,          # 팩터 분석 (Value, Quality, Momentum)
         "module_sentiment_enabled": True,       # 뉴스 감성 분석
+        # ── 분석 모듈 가중치 (%) — 대시보드 설정에서 조절 ──
+        # 합계가 100이 아니어도 됨: 활성 모듈 기준으로 자동 정규화된다.
+        # (OFF 모듈은 제외 후 나머지로 재정규화 — EnsembleConfig.get_effective_weights)
+        "module_technical_weight": 45,          # 기술적 분석 가중치 %
+        "module_factor_weight": 35,             # 팩터 분석 가중치 %
+        "module_sentiment_weight": 20,          # 뉴스 감성 가중치 %
+        # ── 종목별 포지션 한도 오버라이드 (선택) ──
+        # {symbol: fraction} — 등록된 종목만 max_position_size 대신 이 값 적용
+        # 예: {"005930.KS": 0.30} → 삼성전자만 30%까지 허용
+        "position_limit_overrides": {},
+        # ── 뉴스 분석 최대 나이 (일) ──
+        # 감성 분석·LLM 요약에 며칠 이내 뉴스만 사용할지. 5일 권장. 0=필터 비활성.
+        "news_max_age_days": 5,
+        # ── 매도 규칙: 시간 청산 + 절대 손절선 ──
+        "enable_time_stop": True,        # 보유기간 초과 시 자동 매도 (기본 ON)
+        "time_stop_days_short": 3,       # 단타 보유 한도(일)
+        "time_stop_days_swing": 30,      # 스윙 보유 한도(일)
+        "time_stop_days_long": 180,      # 장기 보유 한도(일)
+        "hard_stop_loss_pct": 0,         # 절대 손절선(%) — 0=사용 안 함, 예: 5 = -5%
         # ── 엄격 화이트리스트 모드 ──
         # ON: 사용자 워치리스트에 명시한 종목만 매수 가능
         #     (자동 발굴 종목 차단, 빈 워치리스트일 때 기본값 fallback 안 함)
         # OFF: 기본 동작 (워치리스트 + 자동발굴 + 보유종목)
         "watchlist_strict_mode": False,
+        # ── 자본 배분 모드 ──
+        # "ensemble" (기본) = 단일 앙상블 100% / "sleeves" = 전략별 자본 쿼터
+        "allocation_mode": "ensemble",
+        # 슬리브 비중 {전략: %} — sleeves 모드일 때만 사용. 합계 100 아니어도 자동 정규화.
+        # 사용 가능: momentum/mean_reversion/factor/technical/sentiment/ensemble
+        "strategy_weights": {"momentum": 50, "mean_reversion": 30, "factor": 20},
     }
+
+
+def _module_weight_fraction(settings_dict: dict, key: str,
+                            default_pct: float) -> float:
+    """
+    분석 모듈 가중치 %(0~100 정수)를 0~1 분율로 안전 변환.
+
+    - 비정상 값(문자열/None)이면 default_pct 사용
+    - 음수는 0으로 클램프 (정규화는 EnsembleConfig.get_effective_weights 담당)
+    """
+    try:
+        v = float(settings_dict.get(key, default_pct))
+    except (TypeError, ValueError):
+        v = float(default_pct)
+    return max(0.0, v) / 100.0
+
+
+def _sanitize_position_overrides(raw) -> dict:
+    """
+    종목별 포지션 한도 오버라이드 입력값을 안전한 {symbol: fraction} 딕셔너리로 정규화.
+
+    - 키: 공백 제거 + 대문자 변환 (예: "  005930.ks " → "005930.KS")
+    - 값: 0.01 ~ 0.50 범위로 클램프 (UI 상한 50%와 일치)
+    - 비정상 항목은 조용히 제외 (잘못된 설정으로 전체 매매가 차단되지 않게)
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for sym, frac in raw.items():
+        try:
+            key = str(sym).strip().upper()
+            if not key:
+                continue
+            v = float(frac)
+        except (TypeError, ValueError):
+            continue
+        # 분율 형태로 들어와야 하지만, 사용자가 30(% 의미)을 직접 넣을 수도 있으니
+        # 1.0 초과면 백분율로 간주해 100으로 나눠 보정한다.
+        if v > 1.0:
+            v = v / 100.0
+        if v < 0.01 or v > 0.50:
+            continue  # 안전 범위 밖은 무시 (UI는 1~50%로 제한됨)
+        out[key] = v
+    return out
 
 
 def _load_saved_settings() -> dict:
@@ -1044,12 +1113,32 @@ def api_start_bot():
                 sizing_method=current_settings["sizing_method"],
                 kelly_fraction=current_settings["kelly_fraction"],
                 kelly_min_trades=current_settings.get("kelly_min_trades", 20),
+                # 종목별 한도 오버라이드 — {symbol: fraction}
+                position_limit_overrides=_sanitize_position_overrides(
+                    current_settings.get("position_limit_overrides", {})
+                ),
+                # 뉴스 분석 최대 나이 (일) — 5일 권장, 0=필터 비활성
+                news_max_age_days=max(0, min(30, int(
+                    current_settings.get("news_max_age_days", 5) or 5
+                ))),
+                # ── 매도 규칙 ──
+                enable_time_stop=bool(current_settings.get("enable_time_stop", True)),
+                time_stop_days_short=max(1, min(60, int(
+                    current_settings.get("time_stop_days_short", 3) or 3))),
+                time_stop_days_swing=max(1, min(180, int(
+                    current_settings.get("time_stop_days_swing", 30) or 30))),
+                time_stop_days_long=max(1, min(730, int(
+                    current_settings.get("time_stop_days_long", 180) or 180))),
+                # 대시보드는 %(0~50)로 입력 → 분율로 변환. 0이면 비활성.
+                hard_stop_loss_pct=max(0.0, min(0.5, float(
+                    current_settings.get("hard_stop_loss_pct", 0) or 0) / 100.0)),
             )
         )
 
         # 종목 발굴 설정 반영
         from config.settings import (
             DiscoveryConfig, EnsembleConfig, PositionTypeConfig, WatchlistConfig,
+            AllocationConfig,
         )
         settings.discovery = DiscoveryConfig(
             enabled=current_settings.get("discovery_enabled", True),
@@ -1062,6 +1151,12 @@ def api_start_bot():
         # ── 분석 모듈 enable/disable 토글 반영 ──
         # 비활성 모듈은 ensemble.combine()에서 자동 제외 + 가중치 재정규화
         settings.ensemble = EnsembleConfig(
+            technical=_module_weight_fraction(
+                current_settings, "module_technical_weight", 45),
+            factor=_module_weight_fraction(
+                current_settings, "module_factor_weight", 35),
+            sentiment=_module_weight_fraction(
+                current_settings, "module_sentiment_weight", 20),
             technical_enabled=current_settings.get("module_technical_enabled", True),
             factor_enabled=current_settings.get("module_factor_enabled", True),
             sentiment_enabled=current_settings.get("module_sentiment_enabled", True),
@@ -1079,6 +1174,15 @@ def api_start_bot():
         # ON: 워치리스트에 명시한 종목만 매수 가능 (자동발굴 제외)
         settings.watchlist = WatchlistConfig(
             strict_mode=current_settings.get("watchlist_strict_mode", False),
+        )
+
+        # ── 자본 배분 모드 (앙상블 vs 슬리브) 반영 ──
+        from strategy.sleeves import sanitize_weights as _sanitize_sleeve_weights
+        settings.allocation = AllocationConfig(
+            mode=current_settings.get("allocation_mode", "ensemble"),
+            weights=_sanitize_sleeve_weights(
+                current_settings.get("strategy_weights", {}) or {}
+            ),
         )
 
         # ── 브로커 API 키를 환경변수에 설정 (실거래 시 필요) ──
@@ -1714,28 +1818,48 @@ def api_scanner():
     """
     시장 스캐너 - 관심 분야에서 "주목할 종목" 추출
 
-    선택된 섹터의 종목들을 분석하여 신호 강도 기준 상위 종목을 반환합니다.
-    결과는 캐시되어 반복 요청 시 빠르게 응답합니다.
+    ?modules=technical,factor,sentiment 쿼리로 분석 모듈 조합 선택.
+    선택 안 하면 기본 technical만 사용.
+    각 모듈 점수의 평균(부호 통일)으로 정렬 → 매수 매력이 높은 순.
+
+    캐시는 모듈 조합별로 분리되어, 사용자가 토글 켜고 끌 때마다 새 스캔 없이
+    이전 결과를 반환할 수 있다 (TTL 안에서).
 
     Returns:
         {
-            "results": [{ symbol, name, market, sector, signal, strength, price, change_1d, rsi }],
+            "results": [{ symbol, name, market, sector, signal, strength,
+                          price, change_1d, rsi, reasons,
+                          score_technical, score_factor, score_sentiment,
+                          score_combined, factor_available }],
+            "modules": ["technical", ...],
             "scanned_at": "ISO timestamp",
-            "total_scanned": N
+            "total_scanned": N,
+            "scanning": bool,
         }
     """
-    # 캐시 확인 (설정된 TTL 이내 결과가 있으면 재사용)
+    # ── 모듈 파라미터 파싱 ──
+    valid_modules = {"technical", "factor", "sentiment"}
+    raw = request.args.get("modules", "technical")
+    modules = sorted({
+        m.strip() for m in raw.split(",") if m.strip() in valid_modules
+    })
+    if not modules:
+        modules = ["technical"]
+    cache_key = ",".join(modules)
+
+    # ── 캐시 확인 (모듈 조합별) ──
     global _scanner_cache
     now = datetime.now()
-    if (_scanner_cache and
-        _scanner_cache.get("scanned_at") and
-        (now - datetime.fromisoformat(_scanner_cache["scanned_at"])).seconds < _dash_cfg.scanner_cache_ttl):
-        return jsonify(_scanner_cache)
+    cached = _scanner_cache_by_modules.get(cache_key)
+    if (cached and cached.get("scanned_at") and
+        (now - datetime.fromisoformat(cached["scanned_at"])).seconds
+            < _dash_cfg.scanner_cache_ttl):
+        return jsonify(cached)
 
     # 관심 섹터에서 종목 리스트 추출
     selected_sectors = current_settings.get("interest_sectors", [])
     if not selected_sectors:
-        selected_sectors = AVAILABLE_SECTORS[:3]  # 기본값: 처음 3개 섹터
+        selected_sectors = AVAILABLE_SECTORS[:3]
 
     stocks_to_scan = []
     for sector_key in selected_sectors:
@@ -1748,31 +1872,38 @@ def api_scanner():
                     "sector_name": sector_data.get("name_ko", sector_key),
                 })
 
-    # 비동기로 스캔 실행 (이미 진행 중이 아니면, Lock으로 동시 시작 방지)
+    # ── 비동기 스캔 (모듈 조합별 동시 시작 방지) ──
     with _scanner_lock:
-        should_start = not _scanner_running
+        should_start = not _scanner_running_by_modules.get(cache_key, False)
     if should_start:
         threading.Thread(
             target=_run_scanner,
-            args=(stocks_to_scan,),
+            args=(stocks_to_scan, modules),
             daemon=True
         ).start()
-        # 아직 결과 없으면 빈 결과 + scanning 상태 반환
-        if not _scanner_cache:
+        if not cached:
             return jsonify({
                 "results": [],
                 "scanning": True,
+                "modules": modules,
                 "total_scanned": 0,
-                "scanned_at": None
+                "scanned_at": None,
             })
 
-    return jsonify(_scanner_cache or {"results": [], "scanning": True})
+    return jsonify(cached or {
+        "results": [], "scanning": True, "modules": modules
+    })
 
 
 # 스캐너 캐시 & 상태 (Lock으로 동시 실행 방지)
-_scanner_cache = None
-_scanner_running = False
+# 모듈 조합별 캐시 — 사용자가 [기술적/팩터/감성] 토글로 다른 조합을 켜면
+# 각각 결과가 따로 캐시된다. 키 = sorted modules의 콤마 조인 (예: "factor,sentiment,technical").
+_scanner_cache_by_modules: Dict[str, dict] = {}
+_scanner_running_by_modules: Dict[str, bool] = {}
 _scanner_lock = threading.Lock()
+
+# 호환용 — 옛 코드가 _scanner_cache를 참조할 때 가장 최근 캐시 노출 (없으면 None)
+_scanner_cache = None
 
 # ── 전역 한국 종목명 캐시 ──────────────────────────────────────────────
 # pykrx에서 한 번 로드하면 앱 전체에서 재사용 (스캐너, 분석, 포지션 표시 등)
@@ -1864,16 +1995,21 @@ def get_stock_display_name(symbol: str) -> str:
     return symbol
 
 
-def _run_scanner(stocks_to_scan: list):
+def _run_scanner(stocks_to_scan: list, modules=("technical",)):
     """
     시장 스캐너 백그라운드 실행
 
-    모든 종목을 분석하고 신호 강도 기준 상위 15개를 캐시에 저장합니다.
-    분석 실패한 종목은 건너뜁니다.
+    선택된 modules(기술적/팩터/감성)의 점수를 평균 내어 정렬한 상위 결과를
+    모듈 조합별 캐시에 저장합니다. 분석 실패한 종목은 건너뜁니다.
+
+    Parameters:
+        stocks_to_scan: 분석할 종목 리스트 [{symbol, sector_key, sector_name}]
+        modules: 활성화된 분석 모듈 리스트 (예: ["technical", "factor"])
     """
-    global _scanner_cache, _scanner_running
+    cache_key = ",".join(sorted(modules))
+    global _scanner_cache, _scanner_cache_by_modules, _scanner_running_by_modules
     with _scanner_lock:
-        _scanner_running = True
+        _scanner_running_by_modules[cache_key] = True
 
     results = []
     try:
@@ -1885,6 +2021,27 @@ def _run_scanner(stocks_to_scan: list):
         analyzer = TechnicalAnalyzer(TechnicalConfig())
         us_collector = PriceCollectorUS()
         kr_collector = PriceCollectorKR()
+
+        # ── 선택 모듈에 따라 추가 분석기 lazy-load ──
+        factor_analyzer = None
+        if "factor" in modules:
+            try:
+                from strategy.factor import FactorAnalyzer
+                factor_analyzer = FactorAnalyzer()
+            except Exception as fe:
+                logger.warning(f"[스캐너] FactorAnalyzer 로드 실패: {fe}")
+
+        sent_collector = None
+        if "sentiment" in modules:
+            try:
+                from collectors.news import NewsCollector as _NC
+                sent_collector = _NC(
+                    max_age_days=int(
+                        current_settings.get("news_max_age_days", 5) or 5
+                    )
+                )
+            except Exception as se:
+                logger.warning(f"[스캐너] NewsCollector 로드 실패: {se}")
 
         # ── 전역 한국 종목명 캐시 로드 (아직 안 됐으면) ──
         _load_kr_name_cache()
@@ -1924,6 +2081,55 @@ def _run_scanner(stocks_to_scan: list):
                 except Exception:
                     pass  # 이름 조회 실패해도 결과는 포함
 
+                # ── 모듈별 점수 계산 (-1 ~ +1, 방향 부호 통일) ──
+                # 기술적: BUY=+strength, SELL=-strength, HOLD=0
+                sig_sign = (1 if signal.signal == "BUY"
+                            else -1 if signal.signal == "SELL" else 0)
+                score_technical = round(float(signal.strength) * sig_sign, 3)
+
+                # 팩터: combined (-1 ~ +1). 데이터 없으면 None (한국 종목 yfinance 한계)
+                score_factor = None
+                factor_available = False
+                if factor_analyzer is not None:
+                    try:
+                        fs = factor_analyzer.analyze(symbol)
+                        # 모멘텀은 가격 데이터로 계산되므로 한국 종목도 보통 잡힘.
+                        # 밸류/퀄리티/사이즈는 yfinance info 의존 — 한국은 누락 빈번.
+                        # 한 가지라도 0이 아니면 데이터 있다고 본다.
+                        if fs and any([
+                            getattr(fs, 'momentum', 0) or 0,
+                            getattr(fs, 'value', 0) or 0,
+                            getattr(fs, 'quality', 0) or 0,
+                            getattr(fs, 'size', 0) or 0,
+                        ]):
+                            score_factor = round(float(fs.combined), 3)
+                            factor_available = True
+                    except Exception as fe:
+                        logger.debug(f"[스캐너] {symbol} 팩터 분석 실패: {fe}")
+
+                # 감성: avg_sentiment (-1 ~ +1). 5일 필터 이내 뉴스만.
+                score_sentiment = None
+                if sent_collector is not None:
+                    try:
+                        sent = sent_collector.get_sentiment_summary(symbol)
+                        if sent and sent.get("news_count", 0) > 0:
+                            score_sentiment = round(
+                                float(sent.get("avg_sentiment", 0)), 3
+                            )
+                    except Exception as se:
+                        logger.debug(f"[스캐너] {symbol} 감성 분석 실패: {se}")
+
+                # 종합 점수: 선택된 모듈의 산술 평균 (None=0으로 취급, 결정 2-(b))
+                module_scores = []
+                if "technical" in modules:
+                    module_scores.append(score_technical)
+                if "factor" in modules:
+                    module_scores.append(score_factor if score_factor is not None else 0.0)
+                if "sentiment" in modules:
+                    module_scores.append(score_sentiment if score_sentiment is not None else 0.0)
+                score_combined = (round(sum(module_scores) / len(module_scores), 3)
+                                  if module_scores else 0.0)
+
                 results.append({
                     "symbol": symbol,
                     "name": stock_name,
@@ -1938,6 +2144,12 @@ def _run_scanner(stocks_to_scan: list):
                     "volume": int(df_analyzed["Volume"].iloc[-1]) if "Volume" in df_analyzed.columns else 0,
                     # ★ 신호 판단 근거 — 스캐너 카드에서 "왜 이 신호인지" 펼쳐보기용
                     "reasons": list(signal.reasons) if getattr(signal, "reasons", None) else [],
+                    # ★ 모듈별 점수 (-1 ~ +1, None은 데이터 없음)
+                    "score_technical": score_technical if "technical" in modules else None,
+                    "score_factor": score_factor,
+                    "score_sentiment": score_sentiment,
+                    "score_combined": score_combined,
+                    "factor_available": factor_available,
                 })
 
                 logger.info(f"[스캐너] {symbol} ({stock_name}): {signal.signal} "
@@ -1947,22 +2159,16 @@ def _run_scanner(stocks_to_scan: list):
                 logger.warning(f"[스캐너] {symbol} 분석 실패: {e}")
                 continue
 
-        # 신호 강도 기준 정렬 (BUY > HOLD > SELL, 강도 높은 순)
-        signal_priority = {"BUY": 3, "HOLD": 2, "SELL": 1}
-        results.sort(key=lambda x: (
-            signal_priority.get(x["signal"], 0),
-            x["strength"]
-        ), reverse=True)
+        # ★ 선택된 모듈들의 종합 점수로 정렬 (큰 양수가 매수 매력, 음수는 매도 매력)
+        # 결정 1-(a): 방향 부호 통일 후 평균 → "주목할 종목" = 매수 매력 종합 순
+        results.sort(key=lambda x: x.get("score_combined", 0.0), reverse=True)
 
         # 상위 N개 (한국/미국 균형) — 각 시장에서 최소 절반은 포함
         kr_results = [r for r in results if r["market"] == "KR"]
         us_results = [r for r in results if r["market"] == "US"]
         per_mkt = _dash_cfg.scanner_per_market
         balanced = (kr_results[:per_mkt] + us_results[:per_mkt])
-        balanced.sort(key=lambda x: (
-            signal_priority.get(x["signal"], 0),
-            x["strength"]
-        ), reverse=True)
+        balanced.sort(key=lambda x: x.get("score_combined", 0.0), reverse=True)
         top_n = _dash_cfg.scanner_top_results
         top_results = balanced[:top_n] if balanced else results[:top_n]
 
@@ -1993,8 +2199,8 @@ def _run_scanner(stocks_to_scan: list):
         except Exception:
             pass
 
-        # 캐시에 저장 (전체 결과 + 상위 결과 분리)
-        _scanner_cache = {
+        # 캐시에 저장 (모듈 조합별)
+        snapshot = {
             "results": top_results,           # 기본 표시용 (상위 N개)
             "all_results": results,            # 더보기용 (전체 결과)
             "total_results": len(results),     # 전체 결과 수
@@ -2002,23 +2208,29 @@ def _run_scanner(stocks_to_scan: list):
             "total_scanned": len(stocks_to_scan),
             "scanning": False,
             "discovered": discovered_info,     # 자동 발굴 종목 정보
+            "modules": list(modules),          # 이번 스캔에 사용된 모듈
         }
+        _scanner_cache_by_modules[cache_key] = snapshot
+        _scanner_cache = snapshot  # 호환용 (옛 코드 참조 대비)
 
         logger.info(f"[스캐너] 완료: {len(stocks_to_scan)}개 스캔 → "
                     f"상위 {len(top_results)}개 + 전체 {len(results)}개 캐시")
 
     except Exception as e:
         logger.error(f"[스캐너] 오류: {e}")
-        _scanner_cache = {
+        # 오류 시에도 모듈 조합별 캐시에 빈 결과 남겨 무한 폴링 방지
+        _scanner_cache_by_modules[cache_key] = {
             "results": [],
             "scanned_at": datetime.now().isoformat(),
             "total_scanned": 0,
             "scanning": False,
-            "error": str(e)
+            "modules": list(modules),
+            "error": str(e),
         }
     finally:
+        # 모듈 조합별 running 플래그 해제 + 호환용 단일 플래그도 같이
         with _scanner_lock:
-            _scanner_running = False
+            _scanner_running_by_modules[cache_key] = False
 
 
 @app.route("/api/stock/search")
@@ -2327,7 +2539,9 @@ def api_briefing():
         news_data = None
         try:
             from collectors.news import NewsCollector
-            nc = NewsCollector()
+            nc = NewsCollector(
+                max_age_days=int(current_settings.get("news_max_age_days", 5) or 5)
+            )
             watchlist = current_settings.get("watchlist", ["AAPL", "MSFT"])
             all_news = []
             for sym in watchlist[:3]:  # 상위 3종목만
@@ -2607,6 +2821,7 @@ def _discord_start_bot_callback() -> dict:
         from config.settings import (
             Settings, CapitalConfig, RiskConfig, DiscoveryConfig,
             EnsembleConfig, PositionTypeConfig, WatchlistConfig,
+            AllocationConfig,
         )
         settings = Settings(
             capital=CapitalConfig(
@@ -2624,6 +2839,25 @@ def _discord_start_bot_callback() -> dict:
                 sizing_method=current_settings["sizing_method"],
                 kelly_fraction=current_settings["kelly_fraction"],
                 kelly_min_trades=current_settings.get("kelly_min_trades", 20),
+                # 종목별 한도 오버라이드 — {symbol: fraction}
+                position_limit_overrides=_sanitize_position_overrides(
+                    current_settings.get("position_limit_overrides", {})
+                ),
+                # 뉴스 분석 최대 나이 (일) — 5일 권장, 0=필터 비활성
+                news_max_age_days=max(0, min(30, int(
+                    current_settings.get("news_max_age_days", 5) or 5
+                ))),
+                # ── 매도 규칙 ──
+                enable_time_stop=bool(current_settings.get("enable_time_stop", True)),
+                time_stop_days_short=max(1, min(60, int(
+                    current_settings.get("time_stop_days_short", 3) or 3))),
+                time_stop_days_swing=max(1, min(180, int(
+                    current_settings.get("time_stop_days_swing", 30) or 30))),
+                time_stop_days_long=max(1, min(730, int(
+                    current_settings.get("time_stop_days_long", 180) or 180))),
+                # 대시보드는 %(0~50)로 입력 → 분율로 변환. 0이면 비활성.
+                hard_stop_loss_pct=max(0.0, min(0.5, float(
+                    current_settings.get("hard_stop_loss_pct", 0) or 0) / 100.0)),
             )
         )
         settings.discovery = DiscoveryConfig(
@@ -2635,6 +2869,12 @@ def _discord_start_bot_callback() -> dict:
         )
         # 모듈 + 포지션 유형 토글 반영
         settings.ensemble = EnsembleConfig(
+            technical=_module_weight_fraction(
+                current_settings, "module_technical_weight", 45),
+            factor=_module_weight_fraction(
+                current_settings, "module_factor_weight", 35),
+            sentiment=_module_weight_fraction(
+                current_settings, "module_sentiment_weight", 20),
             technical_enabled=current_settings.get("module_technical_enabled", True),
             factor_enabled=current_settings.get("module_factor_enabled", True),
             sentiment_enabled=current_settings.get("module_sentiment_enabled", True),
@@ -2646,6 +2886,15 @@ def _discord_start_bot_callback() -> dict:
         )
         settings.watchlist = WatchlistConfig(
             strict_mode=current_settings.get("watchlist_strict_mode", False),
+        )
+
+        # ── 자본 배분 모드 (앙상블 vs 슬리브) 반영 ──
+        from strategy.sleeves import sanitize_weights as _sanitize_sleeve_weights
+        settings.allocation = AllocationConfig(
+            mode=current_settings.get("allocation_mode", "ensemble"),
+            weights=_sanitize_sleeve_weights(
+                current_settings.get("strategy_weights", {}) or {}
+            ),
         )
 
         # ── KIS_PAPER / live_mode 자동 동기화 (디스코드 시작 명령용) ──
@@ -3492,8 +3741,14 @@ def _status_broadcaster():
                     _last_price_refresh = _now_price
 
                 # executor에서 현재 상태 가져오기 (블로킹 작업 — 락 밖에서)
-                account = bot_instance.executor.get_account()
-                positions = bot_instance.executor.get_positions()
+                # ★ 표시 경로 — 캐시 버전 우선(KIS 레이트리밋/500 완화). 매매 로직은
+                #   여전히 get_*()로 최신 조회. paper/dual엔 캐시 메서드 없으니 폴백.
+                _ga = getattr(bot_instance.executor, "get_account_cached",
+                              bot_instance.executor.get_account)
+                _gp = getattr(bot_instance.executor, "get_positions_cached",
+                              bot_instance.executor.get_positions)
+                account = _ga()
+                positions = _gp()
 
                 # ★ 빌드는 락 밖에서, 일괄 대입만 락 안에서 (블로킹 최소화)
                 _new_positions = {
@@ -3939,70 +4194,92 @@ def api_kis_status():
 
     # ── [4] 잔고 엔드포인트 검증 (실제 매매 가능성 판단) ──
     # 이게 핵심: 토큰만 발급되고 잔고가 안 잡히는 EGW02007 패턴을 잡아냄
+    #
+    # ★ 봇이 실거래로 실행 중이면 executor의 *캐시된* 잔고를 재사용한다.
+    #   여기서 raw inquire-balance를 또 호출하면 봇의 원장 조회와 합쳐져
+    #   KIS 초당 한도(EGW00201)를 넘겨 'HTTP_500 잔고 실패'가 뜬다.
+    #   캐시 재사용으로 이 위젯이 유발하는 KIS 호출을 0으로 만든다.
+    _reused_cache = False
     try:
-        import requests as _rq
-        tr_id = "VTTC8434R" if paper else "TTTC8434R"
-        url = f"{client.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
-        params = {
-            "CANO": client.cano,
-            "ACNT_PRDT_CD": client.acnt_prdt_cd,
-            "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02",
-            "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01",
-            "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
-        }
-        headers = client._get_headers(tr_id)
-        r = _rq.get(url, headers=headers, params=params, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            rt_cd = data.get("rt_cd", "")
-            msg_cd = data.get("msg_cd", "")
-            msg1 = data.get("msg1", "")
-            if rt_cd == "0":
-                # 정상 — 매수가능액 추출
-                output2 = data.get("output2", [])
-                if output2:
-                    summary = output2[0]
-                    nass = float(summary.get("nass_amt", 0) or 0)
-                    dnca = float(summary.get("dnca_tot_amt", 0) or 0)
-                    result["balance_ok"] = True
-                    result["balance_krw"] = max(nass, dnca)
-            else:
-                # KIS 오류 코드별 사용자 안내
-                result["balance_error"] = {
-                    "code": msg_cd,
-                    "message": msg1,
-                }
-                if msg_cd == "EGW02007":
-                    result["warnings"].append(
-                        f"⚠️ 앱키-모드 불일치: '{msg1.strip()}' — "
-                        f"API_KEYS.txt에서 KIS_PAPER='"
-                        f"{'false' if paper else 'true'}'로 변경하거나 "
-                        f"{'모의투자' if paper else '실거래'}용 앱키를 발급받으세요"
-                    )
-                elif msg_cd == "EGW00121":
-                    result["warnings"].append(
-                        f"⚠️ 계좌번호 오류: '{msg1.strip()}' — "
-                        f"한국투자 앱에서 정확한 계좌번호 재확인 필요"
-                    )
-                elif msg_cd == "EGW00201":
-                    result["warnings"].append(
-                        f"⚠️ 실전투자 API 미신청: '{msg1.strip()}' — "
-                        f"한국투자 앱 > Open API 메뉴에서 신청 필요"
-                    )
-                else:
-                    result["warnings"].append(
-                        f"⚠️ 잔고 조회 오류 [{msg_cd}]: {msg1.strip()}"
-                    )
-        else:
-            result["balance_error"] = {
-                "code": f"HTTP_{r.status_code}",
-                "message": r.text[:200],
+        if (not paper and bot_instance is not None and bot_status.get("running")
+                and hasattr(getattr(bot_instance, "executor", None), "get_account_cached")):
+            _acct = bot_instance.executor.get_account_cached()
+            _bal = (float(getattr(_acct, "buying_power", 0) or 0)
+                    or float(getattr(_acct, "cash", 0) or 0)
+                    or float(getattr(_acct, "total_equity", 0) or 0))
+            if _bal > 0:
+                result["balance_ok"] = True
+                result["balance_krw"] = _bal
+                _reused_cache = True
+    except Exception:
+        pass
+
+    # 봇 미실행 시에만 raw 잔고 조회 (이땐 경쟁 호출이 없어 레이트리밋 안전)
+    if not _reused_cache:
+        try:
+            import requests as _rq
+            tr_id = "VTTC8434R" if paper else "TTTC8434R"
+            url = f"{client.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+            params = {
+                "CANO": client.cano,
+                "ACNT_PRDT_CD": client.acnt_prdt_cd,
+                "AFHR_FLPR_YN": "N", "OFL_YN": "", "INQR_DVSN": "02",
+                "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "01",
+                "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
             }
-            result["warnings"].append(f"잔고 API HTTP 오류: {r.status_code}")
-    except Exception as e:
-        result["balance_error"] = {"code": "EXCEPTION", "message": str(e)}
-        result["warnings"].append(f"잔고 검증 예외: {e}")
+            headers = client._get_headers(tr_id)
+            r = _rq.get(url, headers=headers, params=params, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                rt_cd = data.get("rt_cd", "")
+                msg_cd = data.get("msg_cd", "")
+                msg1 = data.get("msg1", "")
+                if rt_cd == "0":
+                    # 정상 — 매수가능액 추출
+                    output2 = data.get("output2", [])
+                    if output2:
+                        summary = output2[0]
+                        nass = float(summary.get("nass_amt", 0) or 0)
+                        dnca = float(summary.get("dnca_tot_amt", 0) or 0)
+                        result["balance_ok"] = True
+                        result["balance_krw"] = max(nass, dnca)
+                else:
+                    # KIS 오류 코드별 사용자 안내
+                    result["balance_error"] = {
+                        "code": msg_cd,
+                        "message": msg1,
+                    }
+                    if msg_cd == "EGW02007":
+                        result["warnings"].append(
+                            f"⚠️ 앱키-모드 불일치: '{msg1.strip()}' — "
+                            f"API_KEYS.txt에서 KIS_PAPER='"
+                            f"{'false' if paper else 'true'}'로 변경하거나 "
+                            f"{'모의투자' if paper else '실거래'}용 앱키를 발급받으세요"
+                        )
+                    elif msg_cd == "EGW00121":
+                        result["warnings"].append(
+                            f"⚠️ 계좌번호 오류: '{msg1.strip()}' — "
+                            f"한국투자 앱에서 정확한 계좌번호 재확인 필요"
+                        )
+                    elif msg_cd == "EGW00201":
+                        result["warnings"].append(
+                            f"⚠️ 초당 호출 한도 초과: '{msg1.strip()}' — "
+                            f"잠시 후 자동 정상화 (봇 실행 중엔 캐시 재사용)"
+                        )
+                    else:
+                        result["warnings"].append(
+                            f"⚠️ 잔고 조회 오류 [{msg_cd}]: {msg1.strip()}"
+                        )
+            else:
+                result["balance_error"] = {
+                    "code": f"HTTP_{r.status_code}",
+                    "message": r.text[:200],
+                }
+                result["warnings"].append(f"잔고 API HTTP 오류: {r.status_code}")
+        except Exception as e:
+            result["balance_error"] = {"code": "EXCEPTION", "message": str(e)}
+            result["warnings"].append(f"잔고 검증 예외: {e}")
 
     # ── 최종 메시지 ──
     if result["balance_ok"]:
@@ -4213,26 +4490,48 @@ def api_market_status():
     한국 시장: 09:00~15:30 KST (평일)
     미국 시장: 09:30~16:00 ET = 23:30~06:00+1 KST (서머타임 기준)
 
-    한국 공휴일 및 미국 공휴일은 별도 체크합니다.
+    한국 공휴일·임시공휴일·KRX 임시휴장 + 미국 NYSE 휴장일을
+    pandas_market_calendars(XKRX/XNYS)로 자동 반영합니다 (utils/market_holidays.py).
+    데이터 소스 실패 시 디스크 캐시 → 빈 집합(주말만 체크) 폴백.
     """
-    from datetime import datetime, timedelta
+    from datetime import date as _date, datetime, timedelta
     import calendar
+    from utils.market_holidays import (
+        get_holidays, get_holiday_name, is_market_holiday, next_business_day,
+    )
 
     now_kst = datetime.now()  # 서버 시간 = KST 가정
+    today_date = now_kst.date()
     weekday = now_kst.weekday()  # 0=월~6=일
     hour = now_kst.hour
     minute = now_kst.minute
     time_minutes = hour * 60 + minute
 
+    # ── 휴장일 캐시 한번에 로드 ──
+    kr_holidays_year = get_holidays("KR", today_date.year)
+    us_holidays_year = get_holidays("US", today_date.year)
+    is_kr_holiday_today = today_date in kr_holidays_year
+    is_us_holiday_today = today_date in us_holidays_year
+
+    def _fmt_next_biz(d: _date, market: str, open_str: str) -> str:
+        """다음 영업일을 휴장일 건너뛰며 안내 문자열로."""
+        nb = next_business_day(d, market)
+        diff = (nb - d).days
+        return f"다음 거래일: {nb.strftime('%m/%d')} ({diff}일 후) {open_str}"
+
     # ── 한국 시장 (KRX) ──
     kr_open = 9 * 60  # 09:00
     kr_close = 15 * 60 + 30  # 15:30
-
     kr_is_open = False
     kr_status = "휴장"
     kr_next = ""
 
-    if weekday < 5:  # 평일
+    if weekday < 5 and is_kr_holiday_today:
+        # 평일이지만 공휴일/임시공휴일
+        kr_name = get_holiday_name(today_date, "KR") or "임시휴장"
+        kr_status = f"공휴일 휴장 ({kr_name})"
+        kr_next = _fmt_next_biz(today_date, "KR", "09:00")
+    elif weekday < 5:  # 평일·정상 거래
         if time_minutes < kr_open:
             kr_status = "개장 전"
             remaining = kr_open - time_minutes
@@ -4244,19 +4543,13 @@ def api_market_status():
             kr_next = f"폐장까지 {remaining // 60}시간 {remaining % 60}분"
         else:
             kr_status = "폐장"
-            # 다음 영업일 개장까지
-            if weekday == 4:  # 금요일
-                kr_next = "다음 거래일: 월요일 09:00"
-            else:
-                kr_next = "다음 거래일: 내일 09:00"
+            kr_next = _fmt_next_biz(today_date, "KR", "09:00")
     else:
         kr_status = "주말 휴장"
-        days_until = 7 - weekday  # 월요일까지 남은 일수
-        kr_next = f"다음 거래일: 월요일 09:00 ({days_until}일 후)"
+        kr_next = _fmt_next_biz(today_date, "KR", "09:00")
 
     # ── 미국 시장 (NYSE/NASDAQ) ──
-    # ET = KST - 14시간 (서머타임), KST - 13시간 (겨울)
-    # 서머타임 (3월~11월) 기준: 개장 23:30 KST, 폐장 06:00 KST (+1일)
+    # ET = KST - 14h(서머타임) / -13h(겨울). 봇은 서머타임 기준 23:30~06:00 KST로 가정.
     us_open_kst = 23 * 60 + 30   # 23:30 KST
     us_close_kst = 6 * 60        # 06:00 KST (다음날)
 
@@ -4264,16 +4557,18 @@ def api_market_status():
     us_status = "휴장"
     us_next = ""
 
-    # 미국 장 시간은 KST 기준 23:30 ~ 다음날 06:00
-    if weekday < 5:  # 월~금
+    if weekday < 5 and is_us_holiday_today:
+        # 평일이지만 NYSE 휴장
+        us_name = get_holiday_name(today_date, "US") or "Market Holiday"
+        us_status = f"공휴일 휴장 ({us_name})"
+        us_next = _fmt_next_biz(today_date, "US", "23:30 KST")
+    elif weekday < 5:  # 월~금 정상
         if time_minutes >= us_open_kst:
-            # 23:30 이후 = 미국 장 시작 (월~금 밤)
             us_is_open = True
             us_status = "거래 중"
             remaining = (24 * 60 - time_minutes) + us_close_kst
             us_next = f"폐장까지 {remaining // 60}시간 {remaining % 60}분"
         elif time_minutes < us_close_kst and weekday > 0:
-            # 00:00~06:00 = 전날 밤 시작된 미국 장 (화~토 새벽)
             us_is_open = True
             us_status = "거래 중"
             remaining = us_close_kst - time_minutes
@@ -4284,39 +4579,57 @@ def api_market_status():
             us_next = f"개장까지 {remaining // 60}시간 {remaining % 60}분"
         else:
             us_status = "폐장"
-            us_next = "다음 거래일: 오늘 23:30"
+            us_next = _fmt_next_biz(today_date, "US", "23:30 KST")
     elif weekday == 5:  # 토요일
         if time_minutes < us_close_kst:
-            # 금요일 밤 시작된 장 (토요일 새벽)
             us_is_open = True
             us_status = "거래 중"
             remaining = us_close_kst - time_minutes
             us_next = f"폐장까지 {remaining // 60}시간 {remaining % 60}분"
         else:
             us_status = "주말 휴장"
-            us_next = "다음 거래일: 월요일 23:30"
+            us_next = _fmt_next_biz(today_date, "US", "23:30 KST")
     else:  # 일요일
         us_status = "주말 휴장"
-        us_next = "다음 거래일: 월요일 23:30"
+        us_next = _fmt_next_biz(today_date, "US", "23:30 KST")
 
-    # ── 이번 달 거래일 캘린더 ──
+    # ── 이번 달 거래일 캘린더 (휴장일 + 사유 표시) ──
     year = now_kst.year
     month = now_kst.month
-    today = now_kst.day
     _, days_in_month = calendar.monthrange(year, month)
 
     cal_days = []
+    month_holidays = []  # 캘린더 아래 별도 박스용 휴장일 목록
     for d in range(1, days_in_month + 1):
-        dt = datetime(year, month, d)
-        wd = dt.weekday()
-        is_trading = wd < 5  # 주말 제외 (공휴일은 별도 DB 필요)
+        dt_obj = _date(year, month, d)
+        wd = dt_obj.weekday()
+        is_weekend = wd >= 5
+        kr_hol = dt_obj in kr_holidays_year
+        us_hol = dt_obj in us_holidays_year
+
+        # 캘린더는 한국 시장 기준 (KR 휴장 = 봇의 주요 거래 휴식)
+        is_trading = (not is_weekend) and (not kr_hol)
+        kr_name = get_holiday_name(dt_obj, "KR") if kr_hol else None
+        us_name = get_holiday_name(dt_obj, "US") if us_hol else None
+
         cal_days.append({
             "day": d,
             "weekday": ["월","화","수","목","금","토","일"][wd],
             "is_trading": is_trading,
-            "is_today": d == today,
-            "is_past": d < today,
+            "is_today": dt_obj == today_date,
+            "is_past": dt_obj < today_date,
+            "is_weekend": is_weekend,
+            "kr_holiday": kr_name,
+            "us_holiday": us_name,
         })
+
+        if kr_hol or us_hol:
+            month_holidays.append({
+                "day": d,
+                "weekday": ["월","화","수","목","금","토","일"][wd],
+                "kr": kr_name,
+                "us": us_name,
+            })
 
     return jsonify({
         "server_time": now_kst.strftime("%Y-%m-%d %H:%M:%S"),
@@ -4339,6 +4652,7 @@ def api_market_status():
             "month": month,
             "month_name": f"{year}년 {month}월",
             "days": cal_days,
+            "holidays": month_holidays,
         },
     })
 

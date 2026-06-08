@@ -4,7 +4,7 @@
 
 【사용 방법】
   1. 아래 각 항목의 '' (작은따옴표) 안에 API 키를 입력하세요
-     예시:  KIS_APP_KEY = 'PSlawusuUbxfRoVk...'
+     예시:  KIS_APP_KEY = 'PSxxxxxxxxxxxxxx...'  (실제 키 아님)
 
   2. 저장 후 봇을 재시작하면 자동으로 로드됩니다.
 
@@ -26,7 +26,7 @@
 설명:   한국 주식(KOSPI/KOSDAQ) 매매 + 실시간 시세 조회용
 
 # APP KEY (앱 키, 36자리)
-# 작은따옴표 '' 안에 키를 입력하세요. 예) KIS_APP_KEY = 'PSlawus...'
+# 작은따옴표 '' 안에 키를 입력하세요. 예) KIS_APP_KEY = 'PSxxxxxx...'
 KIS_APP_KEY = ''
 
 # APP SECRET (앱 시크릿, App Key보다 길고 복잡함, 180자리)

@@ -110,6 +110,8 @@ class ExitManager:
         trailing_atr_multiplier: 트레일링 스탑 ATR 배수 (기본 3.0, Chandelier)
         enable_partial: 분할 청산 사용 여부 (기본 True)
         enable_time_stop: 시간 기반 청산 (기본 False)
+        hard_stop_loss_pct: 절대 손절선 (분율, 0=비활성). ATR 손절선과 별개로
+                            '진입가 × (1-이값)' 닿으면 매도. 예: 0.05 = -5%.
     """
 
     def __init__(
@@ -119,12 +121,14 @@ class ExitManager:
         trailing_atr_multiplier: float = 3.0,
         enable_partial: bool = True,
         enable_time_stop: bool = False,
+        hard_stop_loss_pct: float = 0.0,
     ):
         self.atr_stop_mult = atr_stop_multiplier
         self.rr_ratio = rr_ratio
         self.trailing_mult = trailing_atr_multiplier
         self.enable_partial = enable_partial
         self.enable_time_stop = enable_time_stop
+        self.hard_stop_loss_pct = max(0.0, float(hard_stop_loss_pct or 0.0))
 
         # 활성 포지션 상태 (symbol -> PositionExitState)
         self.states: Dict[str, PositionExitState] = {}
@@ -260,9 +264,27 @@ class ExitManager:
         # ── 2. 손절/트레일링 발동 체크 ──
         # 분할 익절 전: 최초 하드 스탑 (entry - ATR×stop_mult) → STOP_LOSS
         # 분할 익절 후: 본전 또는 트레일링 → TRAILING_STOP (이미 이익 본 상태)
-        if current_price <= state.current_stop:
+        #
+        # ★ 절대 손절선(hard_stop_loss_pct): ATR 손절선과 별개로 '진입가 -X%' floor.
+        #   ATR 손절선과 둘 중 진입가에 가까운(=높은) 쪽이 먼저 발동한다.
+        #   - 변동성 큰 종목: ATR 손절선이 -7%인데 절대선 -5%면 -5%에서 먼저 매도
+        #   - 이익 구간(트레일링으로 current_stop이 진입가 위)에선 floor가 진입가 아래라 무력 → 영향 없음
+        effective_stop = state.current_stop
+        hard_floor = 0.0
+        if self.hard_stop_loss_pct > 0:
+            hard_floor = state.entry_price * (1.0 - self.hard_stop_loss_pct)
+            if hard_floor > effective_stop:
+                effective_stop = hard_floor
+
+        if current_price <= effective_stop:
             is_trailing = state.partial_sold_pct >= 0.5
             pnl_pct = (current_price / state.entry_price - 1) * 100
+            # 절대 손절선이 ATR 손절선보다 먼저 닿았는지 (사용자 안내용)
+            hit_hard = (
+                self.hard_stop_loss_pct > 0
+                and hard_floor >= state.current_stop
+                and current_price <= hard_floor
+            )
             if is_trailing:
                 return ExitDecision(
                     should_exit=True,
@@ -276,13 +298,15 @@ class ExitManager:
                     ),
                 )
             else:
+                _kind = (f"절대 손절선 -{self.hard_stop_loss_pct*100:.1f}%"
+                         if hit_hard else "하드 스탑(ATR)")
                 return ExitDecision(
                     should_exit=True,
                     reason=ExitReason.STOP_LOSS,
                     sell_ratio=1.0,
                     detail=(
-                        f"하드 스탑 발동: "
-                        f"현재 {current_price:,.2f} ≤ 손절 {state.current_stop:,.2f} "
+                        f"{_kind} 발동: "
+                        f"현재 {current_price:,.2f} ≤ 손절 {effective_stop:,.2f} "
                         f"(손실 {pnl_pct:+.2f}%)"
                     ),
                 )

@@ -19,7 +19,7 @@ config/settings.py - 퀀트봇 전역 설정 파일
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 
 
 # =============================================================================
@@ -119,6 +119,30 @@ class RiskConfig:
     # 통계(승률·손익비)가 불충분하므로 Kelly 대신 fixed 사이징으로 폴백한다.
     # 거래량 자체를 제한하지 않음 (그 전에도 fixed로 정상 거래).
     kelly_min_trades: int = 20
+
+    # ─── 종목별 포지션 한도 오버라이드 (선택) ──────────────────────────
+    # {symbol: fraction} 형식. 등록된 종목만 max_position_size 대신 이 값 적용.
+    # 예: {"005930.KS": 0.30} → 삼성전자만 30%까지 허용
+    # 등록 안 된 종목은 max_position_size(전역 한도)가 그대로 적용된다.
+    # 범위: 0.01 ~ 0.50 (UI에서 1~50% 강제, 백엔드는 받는 값 그대로 사용)
+    position_limit_overrides: Dict[str, float] = field(default_factory=dict)
+
+    # ── 뉴스 분석 최대 나이 (일) ──
+    # 뉴스 감성 분석할 때 며칠 이내 뉴스만 사용할지.
+    # 5일 권장 (사용자 요청). 0이면 필터 비활성(모든 뉴스 사용).
+    # collectors/news.NewsCollector + analyzers/news_llm.NewsCollector 둘 다 적용.
+    news_max_age_days: int = 5
+
+    # ── 매도 규칙: 시간 청산 + 절대 손절선 ──
+    # 시간 청산: 보유 기간이 유형별 한도를 넘으면 손익 무관 자동 시장가 매도.
+    #   기본 ON — '단타로 샀는데 며칠씩 안 팔림' 문제 방지.
+    enable_time_stop: bool = True
+    time_stop_days_short: int = 3     # 단타 보유 한도(일) — '1~3일' 라벨과 정렬
+    time_stop_days_swing: int = 30    # 스윙 보유 한도(일)
+    time_stop_days_long: int = 180    # 장기 보유 한도(일)
+    # 절대 손절선(분율): ATR 손절선과 별개로 '평단 × (1-이값)' 닿으면 매도.
+    #   0.0이면 비활성. 예: 0.05 = -5%. ATR 손절선과 둘 중 먼저 닿는 게 발동.
+    hard_stop_loss_pct: float = 0.0
 
 
 # =============================================================================
@@ -356,6 +380,33 @@ class PositionTypeConfig:
     long_enabled: bool = True     # 장기 (1개월+, 펀더멘탈 우위)
 
 
+@dataclass
+class AllocationConfig:
+    """
+    자본 배분 모드 설정 — 앙상블(단일) vs 슬리브(다중 전략 쿼터)
+
+    mode:
+        "ensemble" — 자본 100%를 단일 앙상블 신호로 운용 (기존 방식, 기본값)
+        "sleeves"  — 자본을 여러 전략에 쿼터로 나눠 각자 독립 매매
+                     (1종목 1슬리브 — 한 종목은 한 전략만 보유)
+
+    weights:
+        슬리브 모드일 때 전략별 자본 비중 {strategy: fraction}.
+        합계가 1.0이 아니어도 CapitalAllocator가 자동 정규화.
+        값 0(또는 누락)인 전략은 비활성. 사용 가능 전략은
+        strategy/sleeves.AVAILABLE_SLEEVES 참조
+        (momentum/mean_reversion/factor/technical/sentiment/ensemble).
+    """
+    mode: str = "ensemble"
+    weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "momentum": 0.5,
+            "mean_reversion": 0.3,
+            "factor": 0.2,
+        }
+    )
+
+
 # =============================================================================
 # 종합 설정 클래스
 # =============================================================================
@@ -385,6 +436,7 @@ class Settings:
     position_types: PositionTypeConfig = field(default_factory=PositionTypeConfig)
     watchlist: WatchlistConfig = field(default_factory=WatchlistConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    allocation: AllocationConfig = field(default_factory=AllocationConfig)
 
     def summary(self) -> str:
         """현재 설정 요약 출력"""

@@ -37,14 +37,21 @@ class NewsCollector:
 
     Google News RSS를 파싱하여 종목 관련 뉴스를 가져옵니다.
     XML 파싱에 feedparser를 사용하며, 없으면 regex 폴백합니다.
+
+    ★ 날짜 필터: 기본 최근 5일 안에 발행된 뉴스만 통과 (사용자 요청).
+       오래된 뉴스로 LLM 요약이 오염되는 걸 막기 위함.
+       max_age_days=0 으로 생성하면 필터 비활성.
     """
 
-    def __init__(self):
+    DEFAULT_MAX_AGE_DAYS = 5
+
+    def __init__(self, max_age_days: int = DEFAULT_MAX_AGE_DAYS):
         # Google News RSS 기본 URL
         # 한국어: hl=ko&gl=KR&ceid=KR:ko
         # 영어: hl=en&gl=US&ceid=US:en
         self.base_url_ko = "https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
         self.base_url_en = "https://news.google.com/rss/search?q={query}&hl=en&gl=US&ceid=US:en"
+        self.max_age_days = max_age_days
 
     def search_news(self, query: str, lang: str = "ko", max_results: int = 5) -> List[Dict]:
         """
@@ -53,7 +60,7 @@ class NewsCollector:
         Parameters:
             query: 검색어 (예: "삼성전자 주식", "AAPL stock")
             lang: "ko" 또는 "en"
-            max_results: 최대 결과 수
+            max_results: 최대 결과 수 (날짜 필터 통과 기준)
 
         Returns:
             [{ "title": 제목, "url": 링크, "source": 출처, "date": 날짜 }, ...]
@@ -84,14 +91,29 @@ class NewsCollector:
 
         feedparser 라이브러리가 있으면 사용하고,
         없으면 정규식으로 기본적인 파싱을 합니다.
+
+        ★ self.max_age_days 이내 뉴스만 통과 (현재가 아닌 발행 시각 기준).
+          파싱 실패한 published는 안전상 포함 (너무 엄격히 잘라내지 않음).
         """
+        from utils.news_filter import is_within_days
+
         results = []
+        skipped_old = 0
 
         try:
             # feedparser가 있으면 사용 (더 안정적)
             import feedparser
             feed = feedparser.parse(xml_data)
-            for entry in feed.entries[:max_results]:
+            for entry in feed.entries:
+                # 날짜 필터 — 통과한 것만 결과에 포함
+                if not is_within_days(
+                    self.max_age_days,
+                    published_str=entry.get("published", ""),
+                    published_parsed=entry.get("published_parsed"),
+                ):
+                    skipped_old += 1
+                    continue
+
                 # Google News RSS는 <source> 태그에 출처가 있음
                 source = ""
                 if hasattr(entry, "source") and hasattr(entry.source, "title"):
@@ -108,6 +130,15 @@ class NewsCollector:
                     "source": source,
                     "date": entry.get("published", ""),
                 })
+
+                if len(results) >= max_results:
+                    break
+
+            if skipped_old > 0:
+                logger.debug(
+                    f"[뉴스] {skipped_old}개 항목이 "
+                    f"{self.max_age_days}일보다 오래되어 제외됨"
+                )
             return results
 
         except ImportError:
@@ -116,11 +147,18 @@ class NewsCollector:
         # feedparser 없으면 정규식 폴백
         # <item> 블록 안에서 <title>, <link>, <pubDate>, <source> 추출
         items = re.findall(r"<item>(.*?)</item>", xml_data, re.DOTALL)
-        for item_xml in items[:max_results]:
+        for item_xml in items:
             title_match = re.search(r"<title>(.*?)</title>", item_xml)
             link_match = re.search(r"<link>(.*?)</link>", item_xml)
             date_match = re.search(r"<pubDate>(.*?)</pubDate>", item_xml)
             source_match = re.search(r'<source[^>]*>(.*?)</source>', item_xml)
+
+            date_str = date_match.group(1).strip() if date_match else ""
+
+            # 날짜 필터 (regex 폴백 경로)
+            if not is_within_days(self.max_age_days, published_str=date_str):
+                skipped_old += 1
+                continue
 
             if title_match and link_match:
                 title = title_match.group(1).strip()
@@ -131,9 +169,17 @@ class NewsCollector:
                     "title": title,
                     "url": link_match.group(1).strip(),
                     "source": source_match.group(1).strip() if source_match else "",
-                    "date": date_match.group(1).strip() if date_match else "",
+                    "date": date_str,
                 })
 
+                if len(results) >= max_results:
+                    break
+
+        if skipped_old > 0:
+            logger.debug(
+                f"[뉴스] {skipped_old}개 항목이 "
+                f"{self.max_age_days}일보다 오래되어 제외됨"
+            )
         return results
 
     def get_stock_news(self, symbol: str, name: str = "", is_kr: bool = False,

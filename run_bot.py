@@ -142,6 +142,10 @@ class QuantBot:
                 order_delay_sec=3 if live else 0,
                 max_order_value=max_order_val,
                 min_order_value=min_order_val,
+                # 종목별 한도 오버라이드 (선택) — 등록된 종목만 max_position_weight 대체
+                position_limit_overrides=getattr(
+                    settings.risk, 'position_limit_overrides', {}
+                ) or {},
             )
         )
         self.logger.info(
@@ -172,9 +176,38 @@ class QuantBot:
             rr_ratio=getattr(settings.risk, 'risk_reward_ratio', 2.0),
             trailing_atr_multiplier=3.0,  # Chandelier Exit 표준
             enable_partial=True,
-            enable_time_stop=False,
+            # ★ 시간 청산 — 설정값 사용 (기본 ON). 단타가 며칠씩 안 팔리는 문제 방지.
+            enable_time_stop=getattr(settings.risk, 'enable_time_stop', True),
+            # ★ 절대 손절선(분율) — ATR 손절선과 별개. 0이면 비활성.
+            hard_stop_loss_pct=getattr(settings.risk, 'hard_stop_loss_pct', 0.0),
         )
         self._restore_exit_states()  # DB에서 ExitManager 상태 복원
+
+        # ── 자본 배분 모드: 앙상블(단일) vs 슬리브(다중 전략 쿼터) ──
+        # 기본 ensemble — 기존 동작 그대로. sleeves면 전략별 자본 쿼터로 독립 매매.
+        from strategy.capital_allocator import CapitalAllocator
+        from strategy.sleeves import sanitize_weights
+        self.allocation_mode = getattr(
+            getattr(settings, "allocation", None), "mode", "ensemble"
+        )
+        self._sleeve_weights = sanitize_weights(
+            getattr(getattr(settings, "allocation", None), "weights", {}) or {}
+        )
+        if self.allocation_mode == "sleeves" and not self._sleeve_weights:
+            self.logger.warning(
+                "[자본배분] 슬리브 모드인데 활성 비중 없음 → ensemble 폴백"
+            )
+            self.allocation_mode = "ensemble"
+        self.capital_allocator = CapitalAllocator(
+            total_capital=settings.capital.total_capital
+        )
+        if self._sleeve_weights:
+            self.capital_allocator.set_weights(self._sleeve_weights)
+        if self.allocation_mode == "sleeves":
+            self.logger.info(
+                "[자본배분] 슬리브 모드 활성: "
+                + ", ".join(f"{k}={v:.0%}" for k, v in self._sleeve_weights.items())
+            )
 
         # ── 적응형 임계값: VIX/체제 기반 동적 매수/매도 임계값 ──
         # 변동성 ↑ → 임계값 ↑ (강한 신호만), 위기장 → 포지션 ↓
@@ -557,6 +590,9 @@ class QuantBot:
             self.settings.capital.total_capital = real_capital
             self.position_sizer.capital = real_capital
             self.safety.capital = real_capital
+            # ★ 첫 성공 표시 — 이후 _run_analysis의 재시도 루프가 멈춘다.
+            #   (시작 시 레이트리밋으로 실패해도 첫 성공까지 매 사이클 재시도)
+            self._capital_synced = True
 
             # ★ 주문 한도도 갱신:
             #   - max_order_value가 '자동'(설정 0)이면 새 자본의 20%로 재계산
@@ -688,6 +724,8 @@ class QuantBot:
                         holding_period="복원됨",
                         bought_at="",
                         mode=mode,
+                        # 슬리브 모드면 최대 비중 슬리브에 귀속 (그 슬리브가 청산 관리)
+                        strategy=(self._default_sleeve() or None),
                     )
                 except Exception as e:
                     self.logger.error(f"[Reconcile] {sym} DB 추가 실패: {e}")
@@ -1361,6 +1399,16 @@ class QuantBot:
         from collectors.news import NewsCollector
         from strategy.factor import FactorAnalyzer
 
+        # ── 실거래 자본 동기화 재시도 (첫 성공까지) ──
+        # 시작 시 _sync_capital_from_broker가 레이트리밋(EGW00201) 등으로 실패하면
+        # capital이 설정 기본값(₩1,000만)에 머물러:
+        #   ① 총수익률이 엉뚱하게 표시(-56% 등) ② 리스크 한도가 실제보다 헐거워짐.
+        # 첫 성공할 때까지 매 사이클 재시도하여 실제 잔고로 보정 (성공 후엔 호출 안 함).
+        if (not getattr(self.executor, "paper", True)
+                and not getattr(self, "_capital_synced", False)):
+            self.logger.info("[자본 동기화] 미완료 — 재시도")
+            self._sync_capital_from_broker()
+
         # ── 시장 영업시간 체크 ──
         # 장 마감 중에 분석은 하되, 매매 실행은 건너뛰어 무의미한 거래 방지
         market_open = self._is_market_open(market)
@@ -1419,7 +1467,9 @@ class QuantBot:
             self.logger.debug(f"[시장 정지 감지] 체크 실패 (정상으로 진행): {e}")
             self._halt_check_result = None
 
-        news_collector = NewsCollector()
+        news_collector = NewsCollector(
+            max_age_days=getattr(self.settings.risk, 'news_max_age_days', 5)
+        )
         factor_analyzer = FactorAnalyzer()
         results = []
 
@@ -1464,9 +1514,14 @@ class QuantBot:
                     )
                 ]
 
+                # 슬리브 모드용: 팩터/감성 원점수 캡처 (계산되면 채움, 없으면 None)
+                _factor_combined = None
+                _sentiment_score = None
+
                 # ── 3. 팩터 분석 → ModuleScore ──
                 try:
                     factor_scores = factor_analyzer.analyze(symbol, df=df_analyzed)
+                    _factor_combined = float(factor_scores.combined)  # 슬리브용 원점수
                     if abs(factor_scores.combined) > 0.01:
                         module_scores.append(
                             ModuleScore(
@@ -1484,6 +1539,8 @@ class QuantBot:
                     sentiment = news_collector.get_sentiment_summary(symbol)
                     avg_sent = sentiment.get("avg_sentiment", 0.0)
                     news_count = sentiment.get("news_count", 0)
+                    # 슬리브용: 뉴스가 있을 때만 감성 원점수 캡처
+                    _sentiment_score = avg_sent if news_count > 0 else None
 
                     # 뉴스가 있을 때만 감성 모듈 추가
                     # 신뢰도: 뉴스 수가 많을수록 높음 (최소 3개는 있어야 의미)
@@ -1622,6 +1679,16 @@ class QuantBot:
                         continue
 
                 # ── 매수/매도 실행 조건 ──
+                # ★ 슬리브 모드: 자본 쿼터 기반 독립 매매 (앙상블 매매 분기 대체)
+                #   ExitManager 손절/익절은 위에서 이미 처리됨 → 여기선 전략 신호만.
+                if self.allocation_mode == "sleeves":
+                    self._sleeve_trade_decision(
+                        symbol, df_analyzed, tech_signal,
+                        _factor_combined, _sentiment_score,
+                        ensemble_signal, module_scores,
+                        market_open, halt_block_this_symbol,
+                    )
+                    continue
                 # [v2.2] 장 마감 중에는 매매 실행을 건너뜀
                 if not market_open:
                     if ensemble_signal.action in ("BUY", "SELL"):
@@ -1783,15 +1850,141 @@ class QuantBot:
             self.logger.debug(f"[실시간시세] {symbol} 조회 실패: {e}")
         return None
 
+    def _default_sleeve(self) -> str:
+        """
+        슬리브 모드에서 소유 불명 포지션(reconcile 복원 등)을 귀속시킬 기본 슬리브.
+        최대 비중 슬리브를 반환. 앙상블 모드/비중없음이면 "" (태그 안 함).
+        """
+        if self.allocation_mode != "sleeves" or not self._sleeve_weights:
+            return ""
+        return max(self._sleeve_weights.items(), key=lambda kv: kv[1])[0]
+
+    def _position_owner(self, symbol: str) -> str:
+        """이 종목을 소유한 슬리브명 (DB strategy 태그). 미보유/미태그면 ''."""
+        if not self.db:
+            return ""
+        try:
+            row = self.db.get_position(
+                symbol, mode=getattr(self.executor, "mode", "paper")
+            )
+            if row and int(row.get("quantity", 0) or 0) > 0:
+                return row.get("strategy", "") or ""
+        except Exception:
+            pass
+        return ""
+
+    def _sync_allocator_usage(self):
+        """CapitalAllocator 총자본/사용량을 현재 계좌·DB 기준으로 동기화."""
+        try:
+            self.capital_allocator.total_capital = float(self.safety.capital)
+            if self._sleeve_weights:
+                self.capital_allocator.set_weights(self._sleeve_weights)
+            usage = self.db.get_sleeve_usage(
+                mode=getattr(self.executor, "mode", "paper")
+            ) if self.db else {}
+            for strat, alloc in self.capital_allocator.allocations.items():
+                alloc.used = float(usage.get(strat, {}).get("used", 0.0))
+        except Exception as e:
+            self.logger.debug(f"[슬리브] 자본 동기화 실패: {e}")
+
+    def _sleeve_trade_decision(self, symbol, df_analyzed, tech_signal,
+                               factor_combined, sentiment_score,
+                               ensemble_signal, module_scores,
+                               market_open, halt_block_this_symbol):
+        """
+        슬리브(자본 쿼터) 모드의 매매 결정. 1종목 1슬리브.
+
+        - 보유 종목: 소유 슬리브의 SELL 신호 시에만 청산
+          (손절/익절/트레일링은 위 ExitManager가 이미 처리 — 손절 우선)
+        - 미보유 종목: 활성 슬리브 중 BUY 신호 + 가용자본으로 pick_strategy → 매수
+        """
+        from strategy.sleeves import compute_all_sleeve_signals
+        if not market_open:
+            return
+        active = [s for s, w in self._sleeve_weights.items() if w > 0]
+        if not active:
+            return
+        signals = compute_all_sleeve_signals(
+            active,
+            df_analyzed=df_analyzed,
+            factor_combined=factor_combined,
+            sentiment_score=sentiment_score,
+            technical_signal=tech_signal,
+            ensemble_signal=ensemble_signal,
+        )
+        owner = self._position_owner(symbol)
+
+        # ── 보유 종목: 소유 슬리브의 SELL 신호만 (손절은 ExitManager가 이미 처리) ──
+        if owner:
+            if owner not in signals:
+                return  # 소유 슬리브 비활성화 → 손절/익절(ExitManager)에만 의존
+            sig, _score = signals[owner]
+            if sig == "SELL":
+                if (self._halt_check_result
+                        and not self._halt_check_result.can_trade_exit):
+                    return
+                if halt_block_this_symbol:
+                    return
+                self.logger.info(
+                    f"[슬리브 매도] {symbol}: {owner} 전략 SELL 신호 → 청산"
+                )
+                self._execute_sell(symbol, exit_reason="signal_sell")
+            return
+
+        # ── 미보유 종목: 매수 후보 슬리브 선택 ──
+        if (self._halt_check_result
+                and not self._halt_check_result.can_trade_new):
+            return
+        if halt_block_this_symbol:
+            return
+        if self._is_in_cooldown(symbol):
+            return
+        # 적응형 위기장 차단
+        if self._current_thresholds is None:
+            try:
+                self._current_thresholds = self.adaptive_thresholds.compute()
+            except Exception:
+                self._current_thresholds = None
+        th = self._current_thresholds
+        if th and th.regime_volatility == "crisis" and th.regime_market == "bear":
+            self.logger.warning(f"[슬리브] {symbol}: 위기+약세 → 매수 차단")
+            return
+
+        # 자본 동기화 후 후보 선택 (BUY 신호 + 가용자본 있는 슬리브 중 점수 최고)
+        self._sync_allocator_usage()
+        sig_map = {s: signals[s][0] for s in active}
+        score_map = {s: signals[s][1] for s in active}
+        if not any(v == "BUY" for v in sig_map.values()):
+            return
+        chosen = self.capital_allocator.pick_strategy(symbol, sig_map, score_map)
+        if not chosen:
+            self.logger.debug(
+                f"[슬리브] {symbol}: BUY 신호 있으나 가용자본 있는 슬리브 없음"
+            )
+            return
+        self.logger.info(
+            f"[슬리브 매수] {symbol}: {chosen} 전략 선택 "
+            f"(점수 {score_map.get(chosen, 0):+.2f}, "
+            f"잔여 ₩{self.capital_allocator.allocations[chosen].available:,.0f})"
+        )
+        self._execute_buy(
+            symbol, df_analyzed, tech_signal,
+            ensemble_signal, module_scores,
+            size_multiplier=(th.position_size_multiplier if th else 1.0),
+            strategy=chosen,
+        )
+
     def _execute_buy(self, symbol: str, df, signal,
                      ensemble_signal=None, module_scores=None,
-                     size_multiplier: float = 1.0):
+                     size_multiplier: float = 1.0, strategy: str = ""):
         """
         매수 실행 (안전장치 체크 + 포지션 유형 분류 포함)
 
         Parameters:
             size_multiplier: 포지션 크기 배수 (적응형 임계값에서 0.5~1.0 전달)
                              변동성이 높으면 1.0 미만으로 포지션 축소
+            strategy: 슬리브 모드에서 이 매수를 소유할 전략명 (자본 상한 + 태그용).
+                      ""이면 앙상블 모드 (기존 동작).
         """
         # ── 최대 낙폭(MDD) 한도 초과 시 신규 매수 자동 중단 ──
         # _check_risk가 MDD > max_drawdown 감지 시 이 래치를 켠다.
@@ -1952,6 +2145,25 @@ class QuantBot:
                 f"(배수 {size_multiplier:.2f})"
             )
 
+        # ── 슬리브 모드: 이 전략의 잔여 자본으로 매수 수량 상한 ──
+        # 기존 Kelly/ATR 사이징 결과를 슬리브 가용자본 내로 깎는다 (질문1 결정사항).
+        if strategy:
+            try:
+                _alloc = self.capital_allocator.allocations.get(strategy)
+                _avail = _alloc.available if _alloc else 0.0
+                if price > 0:
+                    _max_shares = int(_avail / price)
+                    if _max_shares < pos_size.shares:
+                        self.logger.info(
+                            f"[슬리브 한도] {symbol}({strategy}): "
+                            f"{pos_size.shares}주 → {_max_shares}주 "
+                            f"(잔여자본 ₩{_avail:,.0f})"
+                        )
+                        pos_size.shares = max(0, _max_shares)
+                        pos_size.value = pos_size.shares * price
+            except Exception as e:
+                self.logger.debug(f"[슬리브 한도] {symbol} 계산 실패: {e}")
+
         if pos_size.shares <= 0:
             self.logger.warning(
                 f"[매수 취소] {symbol}: 포지션 사이징 결과 0주 "
@@ -1969,14 +2181,22 @@ class QuantBot:
         # - 한도 초과 시 수량을 자동으로 줄여서라도 매수 진행
         # - 수량 조정으로도 해결 불가능한 경우에만 거부 (킬 스위치, 일일 손실 등)
         account = self.executor.get_account()
-        positions = self.executor.get_positions()
+        # ★ 포지션 한도 검사용 스냅샷 — 함수 앞부분에서 이미 검증된
+        #   existing_positions를 재사용한다.
+        #   이전 버그: 여기서 get_positions()를 한 번 더 호출했는데, 그 호출이
+        #   API 실패로 []를 반환하면 SafetyGuard가 '기존 보유 0'으로 오인 →
+        #   종목 비중 한도(max_position_weight, 20%)가 무력화 → 같은 종목을
+        #   한도를 넘어 반복 추가매수(피라미딩)하는 사고가 발생했다.
+        #   existing_positions는 positions_query_succeeded() 가드를 이미 통과했고
+        #   이 함수 안에서는 매매가 없으므로 매수 직전 보유 현황으로 정확하다.
+        #   (KIS inquire-balance 중복 호출도 1건 줄어 레이트리밋 부담 감소)
         safe, reason, adjusted_shares = self.safety.check_order(
             symbol=symbol,
             side="BUY",
             quantity=pos_size.shares,
             price=price,
             account_equity=account.total_equity,
-            positions=positions,
+            positions=existing_positions,
         )
         if not safe:
             self.logger.warning(f"[매수 거부] {symbol}: {reason}")
@@ -2072,10 +2292,23 @@ class QuantBot:
         except (TypeError, ValueError):
             decision_json_str = "{}"
 
+        # ── 추가매수(피라미딩) 정확도용: 매수 직전 보유수량/평단 스냅샷 ──
+        # DB positions에는 '이번 주문 체결량'이 아닌 '누적 보유분'을 기록해야
+        # 추가매수 시에도 수량·평단이 정확하다. existing_positions는 검증된
+        # 매수 전 스냅샷(브로커 기준)이므로 여기에 이번 체결분을 더한다.
+        _pre_buy_qty = 0
+        _pre_buy_avg = 0.0
+        for _p in existing_positions:
+            if (getattr(_p, "symbol", None) == symbol
+                    and getattr(_p, "quantity", 0) > 0):
+                _pre_buy_qty = int(_p.quantity)
+                _pre_buy_avg = float(_p.avg_price)
+                break
+
         # 주문 실행 (decision 정보 첨부)
         order = self.executor.buy_market(
             symbol, pos_size.shares,
-            strategy="ensemble",
+            strategy=(strategy or "ensemble"),  # 슬리브명 → trades.strategy 태그 (손익 귀속)
             decision_json=decision_json_str,
         )
 
@@ -2096,13 +2329,18 @@ class QuantBot:
             self.logger.info(
                 f"[매수 체결] {symbol} {actual_qty}주 @ {actual_price:.2f}"
             )
-            # 알림 금액은 KRW 기준 (USD 종목이면 환산) — 실제 체결분 기준
-            total_krw = to_krw(symbol, actual_qty * actual_price)
-            self.notifier.send_trade_executed(symbol, "BUY", actual_qty, actual_price, total_krw)
-            self.discord.send_trade_executed(symbol, "BUY", actual_qty, actual_price, total_krw)
-            # DB 저장은 paper_executor._execute_order() 내부에서 이미 처리됨
-            # 안전장치에 거래 기록 (실제 체결분 기준)
-            self.safety.record_trade(symbol, "BUY", value=total_krw)
+
+            # ── 누적 보유수량/평단 계산 (추가매수/피라미딩 대응) ──
+            # 매수 전 보유분(_pre_buy_*) + 이번 체결분 = 매수 후 실제 보유분.
+            # DB positions에는 '이번 주문 체결량'이 아닌 이 누적값을 기록해야
+            # 추가매수 시에도 수량·평단이 정확하다.
+            cum_qty = _pre_buy_qty + actual_qty
+            if cum_qty > 0:
+                cum_avg = (_pre_buy_qty * _pre_buy_avg
+                           + actual_qty * actual_price) / cum_qty
+            else:
+                cum_qty = actual_qty
+                cum_avg = actual_price
 
             # ── 포지션 메타데이터 준비 (예외 안 나는 단순 dict 접근) ──
             # ★ 사전 분류 결과 재사용 (사용자 토글 반영됨)
@@ -2114,9 +2352,13 @@ class QuantBot:
             # .get()으로 안전 접근 — 키 누락 시에도 예외 없이 기본값
             type_atr_mult = pos_info.get("atr_stop_multiplier", 2.0)
             type_rr = pos_info.get("rr_ratio", 2.0)
-            holding_days_max = {"단타": 5, "스윙": 30, "장기": 180}.get(
-                pos_info.get("position_type", "스윙"), 30
-            )
+            # ★ 유형별 보유 한도(일) — 설정값 사용 (시간 청산 활성 시 이 일수 경과하면 매도)
+            _days_map = {
+                "단타": getattr(self.settings.risk, "time_stop_days_short", 3),
+                "스윙": getattr(self.settings.risk, "time_stop_days_swing", 30),
+                "장기": getattr(self.settings.risk, "time_stop_days_long", 180),
+            }
+            holding_days_max = _days_map.get(pos_info.get("position_type", "스윙"), 30)
 
             # ── ★ 1단계: ExitManager 등록 (최우선 — 자동 손절 즉시 보장) ──
             # 이전 버그: 분류/DB 작업과 한 try 블록 → DB 오류 시 register_entry에
@@ -2171,19 +2413,42 @@ class QuantBot:
                 )
 
                 if self.db:
+                    _mode = getattr(self.executor, "mode", "paper")
+                    # 추가매수면 기존 행의 분류·진입시각을 보존한다 (피라미딩 A안).
+                    # 신규 매수면 이번 분류 결과로 새로 기록한다.
+                    _existing = self.db.get_position(symbol, mode=_mode)
+                    if _existing:
+                        _save_ptype = (_existing.get("position_type")
+                                       or pos_info.get("position_type", "스윙"))
+                        _save_ptype_en = (_existing.get("position_type_en")
+                                          or pos_info.get("position_type_en", "swing"))
+                        _save_holding = (_existing.get("holding_period")
+                                         or pos_info.get("holding_period", ""))
+                        _save_bought_at = (_existing.get("bought_at")
+                                           or datetime.now().isoformat())
+                        _save_reasons = (_existing.get("reasons_json")
+                                         or _json.dumps(reasons_list, ensure_ascii=False))
+                    else:
+                        _save_ptype = pos_info.get("position_type", "스윙")
+                        _save_ptype_en = pos_info.get("position_type_en", "swing")
+                        _save_holding = pos_info.get("holding_period", "")
+                        _save_bought_at = datetime.now().isoformat()
+                        _save_reasons = _json.dumps(reasons_list, ensure_ascii=False)
                     self.db.update_position(
                         symbol=symbol,
-                        quantity=actual_qty,
-                        avg_price=actual_price,
+                        quantity=cum_qty,            # ★ 누적 보유수량 (추가매수 정확)
+                        avg_price=cum_avg,           # ★ 누적 평단
                         current_price=actual_price,
-                        position_type=pos_info.get("position_type", "스윙"),
-                        position_type_en=pos_info.get("position_type_en", "swing"),
+                        position_type=_save_ptype,
+                        position_type_en=_save_ptype_en,
                         target_price=round(target_price, 2),
                         stop_price=round(stop_price, 2),
-                        reasons_json=_json.dumps(reasons_list, ensure_ascii=False),
-                        holding_period=pos_info.get("holding_period", ""),
-                        bought_at=__import__("datetime").datetime.now().isoformat(),
-                        mode=getattr(self.executor, "mode", "paper"),  # ★ Phase 5
+                        reasons_json=_save_reasons,
+                        holding_period=_save_holding,
+                        bought_at=_save_bought_at,
+                        mode=_mode,  # ★ Phase 5
+                        # 슬리브 소유 태그 (앙상블 모드면 ""→None으로 기존 보존)
+                        strategy=(strategy or None),
                     )
                 self._save_exit_state(symbol)  # DB 동기화
             except Exception as e:
@@ -2191,6 +2456,32 @@ class QuantBot:
                     f"[포지션 메타 저장] {symbol}: DB 저장 실패 "
                     f"(매수+손절등록은 성공, 다음 사이클에서 재동기화): {e}"
                 )
+
+            # ── 3단계: 거래 알림 + 안전장치 기록 (비핵심 — 각각 격리) ──
+            # ★ 이 작업들은 절대 1·2단계(손절 등록·DB 저장)보다 먼저 두지 않는다.
+            #   이전 버그: 알림을 먼저 호출 → 알림에서 예외 발생 시 분석 루프의
+            #   포괄 except가 삼켜버려 포지션이 DB에 영영 기록되지 않았다.
+            #   각 단계를 개별 try로 격리하여 한 알림 실패가 나머지를 막지 않게 한다.
+            try:
+                # 알림 금액은 KRW 기준 (USD 종목이면 환산) — 실제 체결분 기준
+                total_krw = to_krw(symbol, actual_qty * actual_price)
+            except Exception:
+                total_krw = actual_qty * actual_price
+            try:
+                self.notifier.send_trade_executed(
+                    symbol, "BUY", actual_qty, actual_price, total_krw)
+            except Exception as e:
+                self.logger.debug(f"[알림] {symbol} 텔레그램 매수 알림 실패: {e}")
+            try:
+                self.discord.send_trade_executed(
+                    symbol, "BUY", actual_qty, actual_price, total_krw)
+            except Exception as e:
+                self.logger.debug(f"[알림] {symbol} 디스코드 매수 알림 실패: {e}")
+            try:
+                # 안전장치에 거래 기록 (실제 체결분 기준)
+                self.safety.record_trade(symbol, "BUY", value=total_krw)
+            except Exception as e:
+                self.logger.warning(f"[안전장치] {symbol} 매수 거래 기록 실패: {e}")
 
     def _execute_sell(self, symbol: str, exit_reason: str = "signal_sell"):
         """
@@ -2322,13 +2613,9 @@ class QuantBot:
                 f"{'전량 청산' if fully_closed else '부분 체결'} "
                 f"({exit_reason}) | 실현PnL ₩{realized_pnl:,.0f}"
             )
-            self.notifier.send_trade_executed(symbol, "SELL", actual_qty, price, total_krw)
-            self.discord.send_trade_executed(symbol, "SELL", actual_qty, price, total_krw)
-            # DB 저장은 paper_executor._execute_order() 내부에서 이미 처리됨
-            # ★ CRITICAL FIX: pnl도 전달해야 daily_pnl이 누적되고 kill_switch가 발동됨
-            self.safety.record_trade(symbol, "SELL", pnl=realized_pnl, value=total_krw)
-
-            # ── ExitManager 상태 정리 ──
+            # ── 1단계: ExitManager 상태 정리 + DB positions 동기화 (최우선) ──
+            # ★ 알림보다 먼저 처리한다. 알림 예외가 손절 해제·DB 정리를 막으면
+            #   청산된 포지션이 ExitManager/DB에 유령으로 남는다.
             if fully_closed:
                 # 전량 청산 → ExitManager 등록 해제
                 self.exit_manager.unregister(symbol)
@@ -2345,6 +2632,33 @@ class QuantBot:
                 # 부분 체결 → 잔여 포지션은 ExitManager 유지(손절 보호 지속).
                 # 등록 해제·쿨다운 안 함 → 다음 사이클에서 잔여분 청산 재시도.
                 self._save_exit_state(symbol)
+
+            # DB positions 갱신: 전량청산이면 행 삭제, 부분청산이면 잔량 반영.
+            # KIS executor는 positions를 직접 안 쓰므로 동기화 필수.
+            # PaperExecutor는 _execute_order 내부에서 자체 처리하므로 제외.
+            if getattr(self.executor, "name", "") != "paper":
+                remaining = max(0, int(held.quantity) - int(actual_qty))
+                self._update_db_position_after_trade(
+                    symbol, remaining, float(held.avg_price), float(price)
+                )
+
+            # ── 2단계: 거래 알림 + 안전장치 기록 (비핵심 — 각각 격리) ──
+            try:
+                self.notifier.send_trade_executed(
+                    symbol, "SELL", actual_qty, price, total_krw)
+            except Exception as e:
+                self.logger.debug(f"[알림] {symbol} 텔레그램 매도 알림 실패: {e}")
+            try:
+                self.discord.send_trade_executed(
+                    symbol, "SELL", actual_qty, price, total_krw)
+            except Exception as e:
+                self.logger.debug(f"[알림] {symbol} 디스코드 매도 알림 실패: {e}")
+            try:
+                # ★ pnl 전달 — daily_pnl 누적 + kill_switch 발동에 필요
+                self.safety.record_trade(
+                    symbol, "SELL", pnl=realized_pnl, value=total_krw)
+            except Exception as e:
+                self.logger.warning(f"[안전장치] {symbol} 매도 거래 기록 실패: {e}")
 
     def _execute_partial_sell(
         self, symbol: str, ratio: float, exit_reason: str = "take_profit_1",
@@ -2460,24 +2774,101 @@ class QuantBot:
                 f"[부분 매도] {symbol} {sold_qty}주 @ {price:,.2f} "
                 f"(전체의 {ratio*100:.0f}%, {exit_reason}) | PnL ₩{realized_pnl:,.0f}"
             )
-            self.notifier.send_trade_executed(symbol, "SELL", sold_qty, price, total_krw)
-            self.discord.send_trade_executed(symbol, "SELL", sold_qty, price, total_krw)
-            # ★ CRITICAL FIX: pnl 전달 — 안 그러면 SafetyGuard daily_pnl 데드코드
-            self.safety.record_trade(symbol, "SELL", pnl=realized_pnl, value=total_krw)
-
+            # ── 1단계: ExitManager 상태 갱신 + DB positions 동기화 (최우선) ──
             # ★ Phase 6C: 매도 성공 확정 후에만 ExitManager 상태 갱신
             # (이전엔 evaluate()에서 미리 변경 → 매도 실패 시 보호 무력화)
+            # ★ 알림보다 먼저 처리 — 알림 예외가 상태 갱신을 막지 못하게 한다.
             if decision is not None:
                 self.exit_manager.commit_exit(symbol, decision)
-
             # ExitManager 상태는 그대로 유지 (잔여 포지션 트레일링 계속)
             self._save_exit_state(symbol)
+
+            # DB positions 갱신: 부분 매도 후 잔량 반영.
+            # KIS executor는 positions를 직접 안 쓰므로 동기화 필수.
+            # PaperExecutor는 _execute_order 내부에서 자체 처리하므로 제외.
+            if getattr(self.executor, "name", "") != "paper":
+                remaining = max(0, int(held.quantity) - int(sold_qty))
+                self._update_db_position_after_trade(
+                    symbol, remaining, float(held.avg_price), float(price)
+                )
+
+            # ── 2단계: 거래 알림 + 안전장치 기록 (비핵심 — 각각 격리) ──
+            try:
+                self.notifier.send_trade_executed(
+                    symbol, "SELL", sold_qty, price, total_krw)
+            except Exception as e:
+                self.logger.debug(f"[알림] {symbol} 텔레그램 부분매도 알림 실패: {e}")
+            try:
+                self.discord.send_trade_executed(
+                    symbol, "SELL", sold_qty, price, total_krw)
+            except Exception as e:
+                self.logger.debug(f"[알림] {symbol} 디스코드 부분매도 알림 실패: {e}")
+            try:
+                # ★ pnl 전달 — SafetyGuard daily_pnl 누적
+                self.safety.record_trade(
+                    symbol, "SELL", pnl=realized_pnl, value=total_krw)
+            except Exception as e:
+                self.logger.warning(f"[안전장치] {symbol} 부분매도 거래 기록 실패: {e}")
         else:
             # 매도 실패 → state는 변경되지 않음 (다음 사이클에서 재시도 가능)
             status_value = order.status.value if order else "no_order"
             self.logger.warning(
                 f"[부분 매도 실패] {symbol} ratio={ratio} 상태={status_value} "
                 f"— ExitManager state 미변경 (재시도 가능)"
+            )
+
+    def _update_db_position_after_trade(self, symbol: str, new_quantity: int,
+                                        avg_price: float, current_price: float):
+        """
+        체결(매도/부분매도) 후 DB positions 테이블을 실제 보유분에 맞춰 동기화.
+
+        KIS(실거래) executor는 positions 테이블을 직접 쓰지 않으므로,
+        매도 후 이 메서드로 DB를 정렬한다. PaperExecutor는 자체적으로
+        positions를 관리하므로 호출 측에서 paper는 제외하고 부른다.
+
+        Parameters:
+            symbol: 종목 코드
+            new_quantity: 체결 후 잔여 보유수량 (0 이하이면 행 삭제)
+            avg_price: 평균 매수가 (잔여분 갱신용 — 매도는 평단을 바꾸지 않음)
+            current_price: 현재가
+
+        분류·진입시각·손절선 등 메타데이터는 기존 행 값을 그대로 보존한다.
+        실패해도 예외를 전파하지 않는다 (다음 재시작 시 reconcile이 보정).
+        """
+        if not self.db:
+            return
+        mode = getattr(self.executor, "mode", "paper")
+        try:
+            if new_quantity <= 0:
+                # 전량 청산 → DB 행 삭제 (브로커에 없는 포지션을 남기지 않음)
+                self.db.delete_position(symbol, mode=mode)
+                self.logger.info(f"[포지션 DB] {symbol}: 전량 청산 → DB 행 삭제")
+                return
+            existing = self.db.get_position(symbol, mode=mode)
+            if not existing:
+                # DB에 행이 없으면 다음 재시작 reconcile이 복원하므로 스킵
+                return
+            self.db.update_position(
+                symbol=symbol,
+                quantity=int(new_quantity),
+                avg_price=float(avg_price),
+                current_price=float(current_price),
+                position_type=existing.get("position_type", "") or "",
+                position_type_en=existing.get("position_type_en", "") or "",
+                target_price=existing.get("target_price", 0) or 0,
+                stop_price=existing.get("stop_price", 0) or 0,
+                reasons_json=existing.get("reasons_json", "[]") or "[]",
+                holding_period=existing.get("holding_period", "") or "",
+                bought_at=existing.get("bought_at", "") or "",
+                mode=mode,
+            )
+            self.logger.info(
+                f"[포지션 DB] {symbol}: 잔여 {int(new_quantity)}주로 갱신"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"[포지션 DB] {symbol}: 동기화 실패 "
+                f"(다음 재시작 reconcile에서 보정): {e}"
             )
 
     def _check_risk(self):

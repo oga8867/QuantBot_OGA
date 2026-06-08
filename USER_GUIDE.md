@@ -88,8 +88,8 @@ start.bat 더블클릭
 폴더에서 `API_KEYS.txt` 더블클릭 → 메모장 자동 열림 → 따옴표 안에 키 붙여넣기:
 
 ```
-KIS_APP_KEY = 'PSlawusu...'        ← 따옴표 안에만
-KIS_APP_SECRET = 'fOmb9rV09...'
+KIS_APP_KEY = 'PSxxxxxxxx...'      ← 따옴표 안에만 (예시, 실제 키 아님)
+KIS_APP_SECRET = 'xxxxxxxxxx...'
 KIS_ACCOUNT = '12345678-01'
 KIS_PAPER = 'true'                  ← 처음엔 반드시 true!
 ```

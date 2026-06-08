@@ -54,6 +54,10 @@ class SafetyConfig:
     # "America/New_York" → EST/EDT 자정에 리셋 (미국장 기준)
     # None → 서버 로컬 시간 사용
     timezone: Optional[str] = None
+    # 종목별 한도 오버라이드 — {symbol: fraction}
+    # 등록된 종목은 max_position_weight 대신 이 값을 적용한다.
+    # 예: {"005930.KS": 0.30} → 삼성전자는 30%까지 허용
+    position_limit_overrides: Dict[str, float] = field(default_factory=dict)
 
 
 class SafetyGuard:
@@ -309,6 +313,10 @@ class SafetyGuard:
                 return False, reason, 0
 
         # 10. 종목당 최대 비중 -> 수량 조정
+        # ★ 종목별 오버라이드가 등록돼 있으면 그 한도, 없으면 전역 max_position_weight 적용
+        sym_limit = self.config.position_limit_overrides.get(
+            symbol, self.config.max_position_weight
+        )
         current_value = 0
         for p in positions:
             sym = _gpa(p, 'symbol', '')
@@ -317,13 +325,13 @@ class SafetyGuard:
                 break
 
         total_weight = (current_value + order_value) / account_equity
-        if total_weight > self.config.max_position_weight:
-            max_allowed_value = (account_equity * self.config.max_position_weight) - current_value
+        if total_weight > sym_limit:
+            max_allowed_value = (account_equity * sym_limit) - current_value
             if max_allowed_value <= 0:
                 reason = (
                     f"종목 비중 이미 한도 도달: {symbol} "
                     f"현재 {current_value/account_equity*100:.1f}% "
-                    f"(한도 {self.config.max_position_weight*100:.0f}%)"
+                    f"(한도 {sym_limit*100:.0f}%)"
                 )
                 self._log_block(reason)
                 return False, reason, 0
@@ -332,7 +340,7 @@ class SafetyGuard:
                 reason = (
                     f"종목 비중 한도 근접: {symbol} "
                     f"1주 추가 시 {(current_value + price_krw)/account_equity*100:.1f}% "
-                    f"> {self.config.max_position_weight*100:.0f}%"
+                    f"> {sym_limit*100:.0f}%"
                 )
                 self._log_block(reason)
                 return False, reason, 0
@@ -340,7 +348,8 @@ class SafetyGuard:
                 f"[SafetyGuard] 수량 조정 (종목 비중): "
                 f"{adjusted_qty}주 -> {new_qty}주 "
                 f"(기존 {current_value:,.0f} + 신규 {new_qty * price_krw:,.0f} = "
-                f"{(current_value + new_qty * price_krw)/account_equity*100:.1f}%)"
+                f"{(current_value + new_qty * price_krw)/account_equity*100:.1f}%, "
+                f"한도 {sym_limit*100:.0f}%)"
             )
             adjusted_qty = new_qty
             order_value = adjusted_qty * price_krw

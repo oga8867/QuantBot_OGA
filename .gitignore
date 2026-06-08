@@ -79,3 +79,7 @@ htmlcov/
 quant-bot_*.zip
 *_corrupted_backup.*
 
+# ─── 도구/임시 ───
+.omc/
+_*_tmp.py
+

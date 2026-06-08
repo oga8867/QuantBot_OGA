@@ -607,6 +607,9 @@ class PaperExecutor(BaseExecutor):
                         "reasons_json": db_pos.get("reasons_json", "[]"),
                         "holding_period": db_pos.get("holding_period", ""),
                         "bought_at": db_pos.get("bought_at", ""),
+                        # ★ 슬리브 소유 태그 보존 — 없으면 save_positions가 ''로 덮어써
+                        #   1종목 1슬리브가 깨지는 버그 (모의 모드 슬리브 운용 시 치명)
+                        "strategy": db_pos.get("strategy", ""),
                     }
         except Exception as e:
             logger.debug(f"[Paper DB] 기존 메타데이터 로드 실패 (무시): {e}")
@@ -630,6 +633,7 @@ class PaperExecutor(BaseExecutor):
                     "reasons_json": meta.get("reasons_json", "[]"),
                     "holding_period": meta.get("holding_period", ""),
                     "bought_at": meta.get("bought_at", ""),
+                    "strategy": meta.get("strategy", ""),  # ★ 슬리브 태그 보존
                 })
 
         # 3. DB에 저장 (lock 해제 후 — DB I/O 동안 lock 안 잡음)

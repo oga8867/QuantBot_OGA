@@ -55,10 +55,18 @@ class NewsCollector(BaseCollector):
 
     Google News RSS를 통해 헤드라인을 수집하고,
     키워드 기반으로 감성 점수를 계산합니다.
+
+    ★ 날짜 필터: 기본적으로 최근 5일 안에 발행된 뉴스만 통과시킵니다.
+       (오래된 뉴스로 감성 점수가 오염되는 걸 막기 위함 — 사용자 요청)
+       max_age_days=0 으로 생성하면 필터 비활성.
     """
 
-    def __init__(self):
+    # 사용자 요청: 최근 5일 뉴스만 분석에 사용
+    DEFAULT_MAX_AGE_DAYS = 5
+
+    def __init__(self, max_age_days: int = DEFAULT_MAX_AGE_DAYS):
         super().__init__(name="news")
+        self.max_age_days = max_age_days
 
     def collect(self, symbol: str, **kwargs) -> Optional[pd.DataFrame]:
         """
@@ -69,6 +77,7 @@ class NewsCollector(BaseCollector):
             **kwargs:
                 max_items: 최대 수집 건수 (기본 20)
                 language: "en" 또는 "ko"
+                max_age_days: 이 호출 한정 날짜 필터 오버라이드 (없으면 self.max_age_days)
 
         Returns:
             DataFrame: title, published, link, sentiment_score
@@ -79,6 +88,7 @@ class NewsCollector(BaseCollector):
 
         max_items = kwargs.get("max_items", 20)
         language = kwargs.get("language", "en")
+        max_age_days = kwargs.get("max_age_days", self.max_age_days)
 
         # Google News RSS URL 구성
         if language == "ko":
@@ -99,9 +109,21 @@ class NewsCollector(BaseCollector):
             self.logger.warning(f"'{symbol}' 관련 뉴스를 찾을 수 없습니다.")
             return None
 
-        # 뉴스 항목 추출
+        # 날짜 필터 헬퍼
+        from utils.news_filter import is_within_days
+
+        # 뉴스 항목 추출 — 날짜 필터 통과한 것만, 최대 max_items까지
         news_list = []
-        for entry in feed.entries[:max_items]:
+        skipped_old = 0
+        for entry in feed.entries:
+            if not is_within_days(
+                max_age_days,
+                published_str=entry.get("published", ""),
+                published_parsed=entry.get("published_parsed"),
+            ):
+                skipped_old += 1
+                continue
+
             title = entry.get("title", "")
             published = entry.get("published", "")
             link = entry.get("link", "")
@@ -115,6 +137,15 @@ class NewsCollector(BaseCollector):
                 "link": link,
                 "sentiment_score": score,
             })
+
+            if len(news_list) >= max_items:
+                break
+
+        if skipped_old > 0:
+            self.logger.debug(
+                f"'{symbol}': {skipped_old}개 뉴스가 "
+                f"{max_age_days}일보다 오래되어 제외됨"
+            )
 
         df = pd.DataFrame(news_list)
         return df

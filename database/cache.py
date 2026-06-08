@@ -163,6 +163,9 @@ class DatabaseManager:
             ("positions", "partial_sold_pct REAL DEFAULT 0"),           # 이미 매도한 비중 (0/0.5/1.0)
             ("positions", "target_1 REAL DEFAULT 0"),                   # 1차 목표가
             ("positions", "target_2 REAL DEFAULT 0"),                   # 2차 목표가
+            # ── 전략 슬리브(자본 쿼터 모드): 이 포지션을 소유한 전략 ──
+            # 1종목 1슬리브 — 빈 문자열이면 앙상블/미지정. UNIQUE(symbol,mode) 유지.
+            ("positions", "strategy TEXT DEFAULT ''"),
             ("trades", "exit_reason TEXT DEFAULT ''"),                  # 청산 사유 (stop_loss, take_profit_1 등)
             ("trades", "decision_json TEXT DEFAULT '{}'"),              # 매매 결정 상세 (앙상블 점수, 모듈 기여도, 임계값 등)
             # ── ★ Phase 5: 모드 구분 ('paper'/'live') ──
@@ -247,6 +250,16 @@ class DatabaseManager:
             except sqlite3.OperationalError:
                 pass
             logger.warning(f"[DB] positions 마이그레이션 건너뜀: {e}")
+
+        # ── strategy 컬럼 최종 보장 ──
+        # 위 UNIQUE 재생성 경로(테이블 rebuild)는 strategy 컬럼을 누락시킬 수 있으므로,
+        # 모든 마이그레이션 이후에 idempotent ALTER로 한 번 더 보장한다.
+        # (신규 설치·배포 zip 등 fresh DB에서 rebuild가 일어나는 경우 대비)
+        try:
+            c.execute("ALTER TABLE positions ADD COLUMN strategy TEXT DEFAULT ''")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # 이미 존재
 
         # ── ★ Phase 5: portfolio_snapshots UNIQUE(date)→UNIQUE(date,mode) ──
         # 기존: date에만 UNIQUE → 같은 날 paper와 live 스냅샷 불가
@@ -503,8 +516,8 @@ class DatabaseManager:
                         """INSERT INTO positions
                         (symbol, quantity, avg_price, current_price,
                          position_type, position_type_en, target_price, stop_price,
-                         reasons_json, holding_period, bought_at, mode)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         reasons_json, holding_period, bought_at, mode, strategy)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (p["symbol"], p["quantity"], p["avg_price"],
                          p.get("current_price", 0),
                          p.get("position_type", ""),
@@ -514,7 +527,8 @@ class DatabaseManager:
                          p.get("reasons_json", "[]"),
                          p.get("holding_period", ""),
                          p.get("bought_at", ""),
-                         mode))
+                         mode,
+                         p.get("strategy", "")))
                 self.conn.execute("COMMIT")
             except Exception:
                 try:
@@ -527,47 +541,97 @@ class DatabaseManager:
                         position_type="", position_type_en="",
                         target_price=0, stop_price=0,
                         reasons_json="[]", holding_period="", bought_at="",
-                        mode="paper"):
+                        mode="paper", strategy=None):
         """
         포지션 UPSERT (모드별 격리)
 
         composite unique key (symbol, mode) 사용하여
         같은 종목이라도 paper/live 모드별로 독립적인 행을 유지합니다.
+
+        strategy: 이 포지션을 소유한 전략 슬리브명 (자본 쿼터 모드).
+                  None이면 기존 값 보존(메타 업데이트 시 태그 유실 방지),
+                  ""(빈 문자열) 이상이면 그 값으로 설정.
         """
         with self._lock:
             # 같은 모드의 같은 종목이 있으면 업데이트, 없으면 삽입
             existing = self.conn.execute(
-                "SELECT id FROM positions WHERE symbol = ? AND mode = ?",
+                "SELECT id, strategy FROM positions WHERE symbol = ? AND mode = ?",
                 (symbol, mode)
             ).fetchone()
             if existing:
+                # strategy=None이면 기존 태그 보존
+                _strat = existing["strategy"] if strategy is None else strategy
                 self.conn.execute(
                     """UPDATE positions SET
                         quantity = ?, avg_price = ?, current_price = ?,
                         updated_at = ?, position_type = ?, position_type_en = ?,
                         target_price = ?, stop_price = ?,
-                        reasons_json = ?, holding_period = ?, bought_at = ?
+                        reasons_json = ?, holding_period = ?, bought_at = ?,
+                        strategy = ?
                        WHERE symbol = ? AND mode = ?""",
                     (quantity, avg_price, current_price,
                      datetime.now().isoformat(),
                      position_type, position_type_en,
                      target_price, stop_price,
                      reasons_json, holding_period, bought_at,
+                     _strat,
                      symbol, mode))
             else:
                 self.conn.execute(
                     """INSERT INTO positions
                        (symbol, quantity, avg_price, current_price, updated_at,
                         position_type, position_type_en, target_price, stop_price,
-                        reasons_json, holding_period, bought_at, mode)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        reasons_json, holding_period, bought_at, mode, strategy)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (symbol, quantity, avg_price, current_price,
                      datetime.now().isoformat(),
                      position_type, position_type_en,
                      target_price, stop_price,
                      reasons_json, holding_period, bought_at,
-                     mode))
+                     mode, (strategy or "")))
             self.conn.commit()
+
+    def get_sleeve_usage(self, mode="paper"):
+        """
+        전략 슬리브별 자본 사용량/손익 집계 (자본 쿼터 모드 — 파생 계산).
+
+        별도 상태 테이블 없이 positions(현재 점유)+trades(누적 손익)에서 유도하여
+        단일 진실원천을 유지(재시작에도 자동 일관).
+
+        Returns:
+            {strategy: {used, position_count, realized_pnl, trade_count, win_count}}
+            used = Σ(quantity × current_price)  (해당 모드, strategy 태그별)
+        """
+        with self._lock:
+            usage = {}
+            # 현재 점유 자본 (positions)
+            for r in self.conn.execute(
+                "SELECT strategy, quantity, current_price, avg_price "
+                "FROM positions WHERE mode = ?", (mode,)
+            ).fetchall():
+                strat = (r["strategy"] or "")
+                px = r["current_price"] or r["avg_price"] or 0
+                val = (r["quantity"] or 0) * px
+                d = usage.setdefault(strat, {
+                    "used": 0.0, "position_count": 0,
+                    "realized_pnl": 0.0, "trade_count": 0, "win_count": 0})
+                d["used"] += val
+                d["position_count"] += 1
+            # 누적 손익 (trades — SELL 기준)
+            for r in self.conn.execute(
+                "SELECT strategy, pnl FROM trades "
+                "WHERE mode = ? AND UPPER(side) = 'SELL'", (mode,)
+            ).fetchall():
+                strat = (r["strategy"] or "")
+                d = usage.setdefault(strat, {
+                    "used": 0.0, "position_count": 0,
+                    "realized_pnl": 0.0, "trade_count": 0, "win_count": 0})
+                pnl = r["pnl"] or 0
+                d["realized_pnl"] += pnl
+                d["trade_count"] += 1
+                if pnl > 0:
+                    d["win_count"] += 1
+            return usage
 
     def update_exit_state(self, symbol, mode="paper", *,
                           entry_atr=0.0, current_stop=0.0,
