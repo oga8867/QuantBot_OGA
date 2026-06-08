@@ -102,7 +102,7 @@ Write-Host "포함 항목: $($existing.Count)개" -ForegroundColor Cyan
 $existing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Gray }
 
 # ─── 출력 파일명 (타임스탬프) ───────────────────────────────────────────
-$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $output = "quant-bot_$timestamp.zip"
 
 Write-Host ""
@@ -131,6 +131,16 @@ try {
         } else {
             Copy-Item -Path $item -Destination $dest -Force
         }
+    }
+
+    # 1.5) 브라우저 캐시 제거 (모드 무관 — data 포함 시 항상).
+    #   data/.browser_profile은 자동화 브라우저의 캐시 폴더로, 디스코드 토큰 등
+    #   민감 데이터가 캐시될 수 있다(실제 누출 사례 있었음). 봇 실행에는 불필요하며
+    #   자동 재생성되므로, 모드 2·3 어디서든 공유 zip에서 항상 제외한다.
+    $stagedBrowserCache = Join-Path $staging "data\.browser_profile"
+    if (Test-Path $stagedBrowserCache) {
+        Remove-Item $stagedBrowserCache -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "  + data/.browser_profile (브라우저 캐시) 제거 — 토큰 누출 방지" -ForegroundColor Cyan
     }
 
     # 2) 모드 2면 민감정보 자동 스크럽
