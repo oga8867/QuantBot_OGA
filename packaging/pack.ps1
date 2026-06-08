@@ -143,6 +143,18 @@ try {
         Write-Host "  + data/.browser_profile (브라우저 캐시) 제거 — 토큰 누출 방지" -ForegroundColor Cyan
     }
 
+    # 1.6) ★ 모드 1(코드만): config/user_settings.json 제거 — 개인 키 누출 방지.
+    #   config 폴더가 통째로 복사되며 개인 API 키가 든 user_settings.json이 함께
+    #   들어온다(KIS키·디스코드토큰 등). '코드만' 모드는 개인 설정이 없어야 하므로
+    #   staging에서 삭제한다. (모드 2는 아래에서 키 필드만 비움, 모드 3은 그대로 둠)
+    if ($Choice -eq 1) {
+        $stagedUserCfg1 = Join-Path $staging "config\user_settings.json"
+        if (Test-Path $stagedUserCfg1) {
+            Remove-Item $stagedUserCfg1 -Force -ErrorAction SilentlyContinue
+            Write-Host "  + config/user_settings.json 제거 (코드만 모드 — 개인 키 제외)" -ForegroundColor Cyan
+        }
+    }
+
     # 2) 모드 2면 민감정보 자동 스크럽
     if ($Choice -eq 2) {
         Write-Host ""
